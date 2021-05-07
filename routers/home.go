@@ -334,32 +334,7 @@ func ExploreCode(ctx *context.Context) {
 		searchResultLanguages []*code_indexer.SearchResultLanguages
 	)
 
-	// if non-admin login user, we need check UnitTypeCode at first
-	if ctx.User != nil && len(repoIDs) > 0 {
-		repoMaps, err := models.GetRepositoriesMapByIDs(repoIDs)
-		if err != nil {
-			ctx.ServerError("SearchResults", err)
-			return
-		}
-
-		var rightRepoMap = make(map[int64]*models.Repository, len(repoMaps))
-		repoIDs = make([]int64, 0, len(repoMaps))
-		for id, repo := range repoMaps {
-			if repo.CheckUnitUser(ctx.User, models.UnitTypeCode) {
-				rightRepoMap[id] = repo
-				repoIDs = append(repoIDs, id)
-			}
-		}
-
-		ctx.Data["RepoMaps"] = rightRepoMap
-
-		total, searchResults, searchResultLanguages, err = code_indexer.PerformSearch(repoIDs, language, keyword, page, setting.UI.RepoSearchPagingNum, isMatch)
-		if err != nil {
-			ctx.ServerError("SearchResults", err)
-			return
-		}
-		// if non-login user or isAdmin, no need to check UnitTypeCode
-	} else if (ctx.User == nil && len(repoIDs) > 0) || isAdmin {
+	if len(repoIDs) > 0 || isAdmin {
 		total, searchResults, searchResultLanguages, err = code_indexer.PerformSearch(repoIDs, language, keyword, page, setting.UI.RepoSearchPagingNum, isMatch)
 		if err != nil {
 			ctx.ServerError("SearchResults", err)
