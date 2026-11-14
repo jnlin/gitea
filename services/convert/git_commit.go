@@ -8,14 +8,13 @@ import (
 	"net/url"
 	"time"
 
-	repo_model "code.gitea.io/gitea/models/repo"
-	user_model "code.gitea.io/gitea/models/user"
-	ctx "code.gitea.io/gitea/modules/context"
-	"code.gitea.io/gitea/modules/git"
-	"code.gitea.io/gitea/modules/log"
-	api "code.gitea.io/gitea/modules/structs"
-	"code.gitea.io/gitea/modules/util"
-	"code.gitea.io/gitea/services/gitdiff"
+	repo_model "gitea.dev/models/repo"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/git"
+	"gitea.dev/modules/log"
+	api "gitea.dev/modules/structs"
+	ctx "gitea.dev/services/context"
+	"gitea.dev/services/gitdiff"
 )
 
 // ToCommitUser convert a git.Signature to an api.CommitUser
@@ -33,7 +32,7 @@ func ToCommitUser(sig *git.Signature) *api.CommitUser {
 func ToCommitMeta(repo *repo_model.Repository, tag *git.Tag) *api.CommitMeta {
 	return &api.CommitMeta{
 		SHA:     tag.Object.String(),
-		URL:     util.URLJoin(repo.APIURL(), "git/commits", tag.ID.String()),
+		URL:     repo.APIURL() + "/git/commits/" + tag.ID.String(),
 		Created: tag.Tagger.When,
 	}
 }
@@ -56,8 +55,8 @@ func ToPayloadCommit(ctx context.Context, repo *repo_model.Repository, c *git.Co
 
 	return &api.PayloadCommit{
 		ID:      c.ID.String(),
-		Message: c.Message(),
-		URL:     util.URLJoin(repo.HTMLURL(), "commit", c.ID.String()),
+		Message: c.MessageUTF8(),
+		URL:     repo.HTMLURL() + "/commit/" + c.ID.String(),
 		Author: &api.PayloadUser{
 			Name:     c.Author.Name,
 			Email:    c.Author.Email,
@@ -93,15 +92,7 @@ func ToCommit(ctx context.Context, repo *repo_model.Repository, gitRepo *git.Rep
 
 	// Retrieve author and committer information
 
-	var cacheAuthor *user_model.User
-	var ok bool
-	if userCache == nil {
-		cacheAuthor = (*user_model.User)(nil)
-		ok = false
-	} else {
-		cacheAuthor, ok = userCache[commit.Author.Email]
-	}
-
+	cacheAuthor, ok := userCache[commit.Author.Email]
 	if ok {
 		apiAuthor = ToUser(ctx, cacheAuthor, nil)
 	} else {
@@ -116,14 +107,7 @@ func ToCommit(ctx context.Context, repo *repo_model.Repository, gitRepo *git.Rep
 		}
 	}
 
-	var cacheCommitter *user_model.User
-	if userCache == nil {
-		cacheCommitter = (*user_model.User)(nil)
-		ok = false
-	} else {
-		cacheCommitter, ok = userCache[commit.Committer.Email]
-	}
-
+	cacheCommitter, ok := userCache[commit.Committer.Email]
 	if ok {
 		apiCommitter = ToUser(ctx, cacheCommitter, nil)
 	} else {
@@ -171,10 +155,10 @@ func ToCommit(ctx context.Context, repo *repo_model.Repository, gitRepo *git.Rep
 				},
 				Date: commit.Committer.When.Format(time.RFC3339),
 			},
-			Message: commit.Message(),
+			Message: commit.MessageUTF8(),
 			Tree: &api.CommitMeta{
-				URL:     repo.APIURL() + "/git/trees/" + url.PathEscape(commit.ID.String()),
-				SHA:     commit.ID.String(),
+				URL:     repo.APIURL() + "/git/trees/" + url.PathEscape(commit.TreeID.String()),
+				SHA:     commit.TreeID.String(),
 				Created: commit.Committer.When,
 			},
 		},
@@ -190,17 +174,17 @@ func ToCommit(ctx context.Context, repo *repo_model.Repository, gitRepo *git.Rep
 
 	// Retrieve files affected by the commit
 	if opts.Files {
-		fileStatus, err := git.GetCommitFileStatus(gitRepo.Ctx, repo.RepoPath(), commit.ID.String())
+		fileStatusSummary, err := git.GetCommitFileStatus(ctx, repo, commit.ID.String())
 		if err != nil {
 			return nil, err
 		}
 
-		affectedFileList := make([]*api.CommitAffectedFiles, 0, len(fileStatus.Added)+len(fileStatus.Removed)+len(fileStatus.Modified))
-		for filestatus, files := range map[string][]string{"added": fileStatus.Added, "removed": fileStatus.Removed, "modified": fileStatus.Modified} {
+		affectedFileList := make([]*api.CommitAffectedFiles, 0, len(fileStatusSummary.Added)+len(fileStatusSummary.Removed)+len(fileStatusSummary.Modified))
+		for fileStatus, files := range map[string][]string{"added": fileStatusSummary.Added, "removed": fileStatusSummary.Removed, "modified": fileStatusSummary.Modified} {
 			for _, filename := range files {
 				affectedFileList = append(affectedFileList, &api.CommitAffectedFiles{
 					Filename: filename,
-					Status:   filestatus,
+					Status:   fileStatus,
 				})
 			}
 		}
@@ -210,17 +194,15 @@ func ToCommit(ctx context.Context, repo *repo_model.Repository, gitRepo *git.Rep
 
 	// Get diff stats for commit
 	if opts.Stat {
-		diff, err := gitdiff.GetDiff(gitRepo, &gitdiff.DiffOptions{
-			AfterCommitID: commit.ID.String(),
-		})
+		diffShortStat, err := gitdiff.GetDiffShortStat(ctx, gitRepo, &gitdiff.DiffCommonOptions{AfterCommitID: commit.ID.String()})
 		if err != nil {
 			return nil, err
 		}
 
 		res.Stats = &api.CommitStats{
-			Total:     diff.TotalAddition + diff.TotalDeletion,
-			Additions: diff.TotalAddition,
-			Deletions: diff.TotalDeletion,
+			Total:     diffShortStat.TotalAddition + diffShortStat.TotalDeletion,
+			Additions: diffShortStat.TotalAddition,
+			Deletions: diffShortStat.TotalDeletion,
 		}
 	}
 

@@ -6,7 +6,8 @@ package packages
 import (
 	"io"
 
-	"code.gitea.io/gitea/modules/util/filebuffer"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/util/filebuffer"
 )
 
 // HashedSizeReader provide methods to read, sum hashes and a Size method
@@ -32,13 +33,13 @@ func NewHashedBuffer() (*HashedBuffer, error) {
 	return NewHashedBufferWithSize(DefaultMemorySize)
 }
 
-// NewHashedBuffer creates a hashed buffer with a specific memory size
+// NewHashedBufferWithSize creates a hashed buffer with a specific memory size
 func NewHashedBufferWithSize(maxMemorySize int) (*HashedBuffer, error) {
-	b, err := filebuffer.New(maxMemorySize)
+	tempDir, err := setting.AppDataTempDir("package-hashed-buffer").MkdirAllSub("")
 	if err != nil {
 		return nil, err
 	}
-
+	b := filebuffer.New(maxMemorySize, tempDir)
 	hash := NewMultiHasher()
 
 	combinedWriter := io.MultiWriter(b, hash)
@@ -64,6 +65,7 @@ func CreateHashedBufferFromReaderWithSize(r io.Reader, maxMemorySize int) (*Hash
 
 	_, err = io.Copy(b, r)
 	if err != nil {
+		_ = b.Close()
 		return nil, err
 	}
 

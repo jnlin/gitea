@@ -7,22 +7,23 @@ import (
 	"fmt"
 	"net/http"
 
-	"code.gitea.io/gitea/models/auth"
-	"code.gitea.io/gitea/modules/base"
-	"code.gitea.io/gitea/modules/context"
-	"code.gitea.io/gitea/modules/setting"
-	shared_user "code.gitea.io/gitea/routers/web/shared/user"
-	user_setting "code.gitea.io/gitea/routers/web/user/setting"
+	"gitea.dev/models/auth"
+	"gitea.dev/models/db"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/templates"
+	shared_user "gitea.dev/routers/web/shared/user"
+	user_setting "gitea.dev/routers/web/user/setting"
+	"gitea.dev/services/context"
 )
 
 const (
-	tplSettingsApplications         base.TplName = "org/settings/applications"
-	tplSettingsOAuthApplicationEdit base.TplName = "org/settings/applications_oauth2_edit"
+	tplSettingsApplications         templates.TplName = "org/settings/applications"
+	tplSettingsOAuthApplicationEdit templates.TplName = "org/settings/applications_oauth2_edit"
 )
 
 func newOAuth2CommonHandlers(org *context.Organization) *user_setting.OAuth2CommonHandlers {
 	return &user_setting.OAuth2CommonHandlers{
-		OwnerID:            org.Organization.ID,
+		Owner:              org.Organization.AsUser(),
 		BasePathList:       fmt.Sprintf("%s/org/%s/settings/applications", setting.AppSubURL, org.Organization.Name),
 		BasePathEditPrefix: fmt.Sprintf("%s/org/%s/settings/applications/oauth2", setting.AppSubURL, org.Organization.Name),
 		TplAppEdit:         tplSettingsOAuthApplicationEdit,
@@ -35,16 +36,17 @@ func Applications(ctx *context.Context) {
 	ctx.Data["PageIsOrgSettings"] = true
 	ctx.Data["PageIsSettingsApplications"] = true
 
-	apps, err := auth.GetOAuth2ApplicationsByUserID(ctx, ctx.Org.Organization.ID)
+	apps, err := db.Find[auth.OAuth2Application](ctx, auth.FindOAuth2ApplicationsOptions{
+		OwnerID: ctx.Org.Organization.ID,
+	})
 	if err != nil {
-		ctx.ServerError("GetOAuth2ApplicationsByUserID", err)
+		ctx.ServerErrorAuto(err)
 		return
 	}
 	ctx.Data["Applications"] = apps
 
-	err = shared_user.LoadHeaderCount(ctx)
-	if err != nil {
-		ctx.ServerError("LoadHeaderCount", err)
+	if _, err := shared_user.RenderUserOrgHeader(ctx); err != nil {
+		ctx.ServerErrorAuto(err)
 		return
 	}
 
@@ -82,7 +84,7 @@ func OAuth2ApplicationEdit(ctx *context.Context) {
 
 // OAuthApplicationsRegenerateSecret handles the post request for regenerating the secret
 func OAuthApplicationsRegenerateSecret(ctx *context.Context) {
-	ctx.Data["Title"] = ctx.Tr("settings")
+	ctx.Data["Title"] = ctx.Tr("settings_title")
 	ctx.Data["PageIsOrgSettings"] = true
 	ctx.Data["PageIsSettingsApplications"] = true
 

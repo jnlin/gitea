@@ -4,128 +4,41 @@
 package code
 
 import (
-	"context"
-	"os"
 	"testing"
 
-	"code.gitea.io/gitea/models/unittest"
-	"code.gitea.io/gitea/modules/git"
-	"code.gitea.io/gitea/modules/indexer/code/bleve"
-	"code.gitea.io/gitea/modules/indexer/code/elasticsearch"
-	"code.gitea.io/gitea/modules/indexer/code/internal"
+	"gitea.dev/models/db"
+	"gitea.dev/models/unittest"
+	"gitea.dev/modules/indexer/code/bleve"
+	"gitea.dev/modules/indexer/code/internal"
 
-	_ "code.gitea.io/gitea/models"
-	_ "code.gitea.io/gitea/models/actions"
-	_ "code.gitea.io/gitea/models/activities"
+	_ "gitea.dev/models"
+	_ "gitea.dev/models/actions"
+	_ "gitea.dev/models/activities"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
-func TestMain(m *testing.M) {
-	unittest.MainTest(m)
-}
+func TestMain(m *testing.M) { unittest.MainTest(m) }
 
-func testIndexer(name string, t *testing.T, indexer internal.Indexer) {
-	t.Run(name, func(t *testing.T) {
-		var repoID int64 = 1
-		err := index(git.DefaultContext, indexer, repoID)
-		assert.NoError(t, err)
-		keywords := []struct {
-			RepoIDs []int64
-			Keyword string
-			IDs     []int64
-			Langs   int
-		}{
-			{
-				RepoIDs: nil,
-				Keyword: "Description",
-				IDs:     []int64{repoID},
-				Langs:   1,
-			},
-			{
-				RepoIDs: []int64{2},
-				Keyword: "Description",
-				IDs:     []int64{},
-				Langs:   0,
-			},
-			{
-				RepoIDs: nil,
-				Keyword: "repo1",
-				IDs:     []int64{repoID},
-				Langs:   1,
-			},
-			{
-				RepoIDs: []int64{2},
-				Keyword: "repo1",
-				IDs:     []int64{},
-				Langs:   0,
-			},
-			{
-				RepoIDs: nil,
-				Keyword: "non-exist",
-				IDs:     []int64{},
-				Langs:   0,
-			},
-		}
-
-		for _, kw := range keywords {
-			t.Run(kw.Keyword, func(t *testing.T) {
-				total, res, langs, err := indexer.Search(context.TODO(), kw.RepoIDs, "", kw.Keyword, 1, 10, false)
-				assert.NoError(t, err)
-				assert.Len(t, kw.IDs, int(total))
-				assert.Len(t, langs, kw.Langs)
-
-				ids := make([]int64, 0, len(res))
-				for _, hit := range res {
-					ids = append(ids, hit.RepoID)
-					assert.EqualValues(t, "# repo1\n\nDescription for repo1", hit.Content)
-				}
-				assert.EqualValues(t, kw.IDs, ids)
-			})
-		}
-
-		assert.NoError(t, indexer.Delete(context.Background(), repoID))
-	})
-}
-
-func TestBleveIndexAndSearch(t *testing.T) {
+func TestIndexRepository(t *testing.T) {
 	unittest.PrepareTestEnv(t)
-
-	dir := t.TempDir()
-
-	idx := bleve.NewIndexer(dir)
-	_, err := idx.Init(context.Background())
-	if err != nil {
-		assert.Fail(t, "Unable to create bleve indexer Error: %v", err)
-		if idx != nil {
-			idx.Close()
-		}
-		return
-	}
+	idx := bleve.NewIndexer(t.TempDir())
+	_, err := idx.Init(t.Context())
+	require.NoError(t, err)
 	defer idx.Close()
-
-	testIndexer("beleve", t, idx)
-}
-
-func TestESIndexAndSearch(t *testing.T) {
-	unittest.PrepareTestEnv(t)
-
-	u := os.Getenv("TEST_INDEXER_CODE_ES_URL")
-	if u == "" {
-		t.SkipNow()
-		return
-	}
-
-	indexer := elasticsearch.NewIndexer(u, "gitea_codes")
-	if _, err := indexer.Init(context.Background()); err != nil {
-		assert.Fail(t, "Unable to init ES indexer Error: %v", err)
-		if indexer != nil {
-			indexer.Close()
-		}
-		return
-	}
-
-	defer indexer.Close()
-
-	testIndexer("elastic_search", t, indexer)
+	require.NoError(t, index(t.Context(), idx, 1))
+	var indexer internal.Indexer = idx
+	previousIndexer := globalIndexer.Load()
+	defer globalIndexer.Store(previousIndexer)
+	globalIndexer.Store(&indexer)
+	total, results, _, err := PerformSearch(t.Context(), &SearchOptions{Terms: []string{"Description"}, Paginator: &db.ListOptions{Page: 1, PageSize: 1}})
+	require.NoError(t, err)
+	assert.Positive(t, total)
+	require.Len(t, results, 1)
+	assert.Equal(t, []*ResultFragment{{StartLine: 2, Content: "\nDescription for repo1", Matches: []MatchRange{{Start: 1, End: 12}}}}, BuildResultFragments(results[0].Content, results[0].ContentMatches))
+	require.NoError(t, idx.Delete(t.Context(), 1))
+	total, _, _, err = idx.Search(t.Context(), &internal.SearchOptions{Terms: []string{"Description"}, Paginator: &db.ListOptions{Page: 1, PageSize: 1}})
+	require.NoError(t, err)
+	assert.Zero(t, total)
 }

@@ -7,15 +7,16 @@ package repo
 import (
 	"net/http"
 	"strconv"
-	"time"
 
-	issues_model "code.gitea.io/gitea/models/issues"
-	"code.gitea.io/gitea/modules/context"
-	api "code.gitea.io/gitea/modules/structs"
-	"code.gitea.io/gitea/modules/timeutil"
-	"code.gitea.io/gitea/modules/web"
-	"code.gitea.io/gitea/routers/api/v1/utils"
-	"code.gitea.io/gitea/services/convert"
+	"gitea.dev/models/db"
+	issues_model "gitea.dev/models/issues"
+	api "gitea.dev/modules/structs"
+	"gitea.dev/modules/timeutil"
+	"gitea.dev/modules/web"
+	"gitea.dev/routers/api/v1/utils"
+	"gitea.dev/routers/common"
+	"gitea.dev/services/context"
+	"gitea.dev/services/convert"
 )
 
 // ListMilestones list milestones for a repository
@@ -55,17 +56,19 @@ func ListMilestones(ctx *context.APIContext) {
 	// responses:
 	//   "200":
 	//     "$ref": "#/responses/MilestoneList"
-	//   "404":
-	//     "$ref": "#/responses/notFound"
+	//   default:
+	//     "$ref": "#/responses/error"
 
-	milestones, total, err := issues_model.GetMilestones(issues_model.GetMilestonesOption{
+	isClosed := common.ParseIssueFilterStateIsClosed(ctx.FormString("state"))
+
+	milestones, total, err := db.FindAndCount[issues_model.Milestone](ctx, issues_model.FindMilestoneOptions{
 		ListOptions: utils.GetListOptions(ctx),
 		RepoID:      ctx.Repo.Repository.ID,
-		State:       api.StateType(ctx.FormString("state")),
+		IsClosed:    isClosed,
 		Name:        ctx.FormString("name"),
 	})
 	if err != nil {
-		ctx.Error(http.StatusInternalServerError, "GetMilestones", err)
+		ctx.APIErrorInternal(err)
 		return
 	}
 
@@ -104,8 +107,8 @@ func GetMilestone(ctx *context.APIContext) {
 	// responses:
 	//   "200":
 	//     "$ref": "#/responses/Milestone"
-	//   "404":
-	//     "$ref": "#/responses/notFound"
+	//   default:
+	//     "$ref": "#/responses/error"
 
 	milestone := getMilestoneByIDOrName(ctx)
 	if ctx.Written() {
@@ -142,29 +145,27 @@ func CreateMilestone(ctx *context.APIContext) {
 	// responses:
 	//   "201":
 	//     "$ref": "#/responses/Milestone"
-	//   "404":
-	//     "$ref": "#/responses/notFound"
-	form := web.GetForm(ctx).(*api.CreateMilestoneOption)
-
-	if form.Deadline == nil {
-		defaultDeadline, _ := time.ParseInLocation("2006-01-02", "9999-12-31", time.Local)
-		form.Deadline = &defaultDeadline
-	}
+	//   default:
+	//     "$ref": "#/responses/error"
+	form := web.GetForm[*api.CreateMilestoneOption](ctx)
 
 	milestone := &issues_model.Milestone{
-		RepoID:       ctx.Repo.Repository.ID,
-		Name:         form.Title,
-		Content:      form.Description,
-		DeadlineUnix: timeutil.TimeStamp(form.Deadline.Unix()),
+		RepoID:  ctx.Repo.Repository.ID,
+		Name:    form.Title,
+		Content: form.Description,
 	}
-
+	_, err := common.ApplyAPIDeadlineTimestamp(&milestone.DeadlineUnix, form.Deadline, nil)
+	if err != nil {
+		ctx.APIErrorAuto(err)
+		return
+	}
 	if form.State == "closed" {
 		milestone.IsClosed = true
 		milestone.ClosedDateUnix = timeutil.TimeStampNow()
 	}
 
 	if err := issues_model.NewMilestone(ctx, milestone); err != nil {
-		ctx.Error(http.StatusInternalServerError, "NewMilestone", err)
+		ctx.APIErrorInternal(err)
 		return
 	}
 	ctx.JSON(http.StatusCreated, convert.ToAPIMilestone(milestone))
@@ -202,11 +203,11 @@ func EditMilestone(ctx *context.APIContext) {
 	// responses:
 	//   "200":
 	//     "$ref": "#/responses/Milestone"
-	//   "404":
-	//     "$ref": "#/responses/notFound"
-	form := web.GetForm(ctx).(*api.EditMilestoneOption)
+	//   default:
+	//     "$ref": "#/responses/error"
+	form := web.GetForm[*api.EditMilestoneOption](ctx)
 	milestone := getMilestoneByIDOrName(ctx)
-	if ctx.Written() {
+	if milestone == nil {
 		return
 	}
 
@@ -216,8 +217,9 @@ func EditMilestone(ctx *context.APIContext) {
 	if form.Description != nil {
 		milestone.Content = *form.Description
 	}
-	if form.Deadline != nil && !form.Deadline.IsZero() {
-		milestone.DeadlineUnix = timeutil.TimeStamp(form.Deadline.Unix())
+	if _, err := common.ApplyAPIDeadlineTimestamp(&milestone.DeadlineUnix, form.Deadline, nil); err != nil {
+		ctx.APIErrorAuto(err)
+		return
 	}
 
 	oldIsClosed := milestone.IsClosed
@@ -226,7 +228,7 @@ func EditMilestone(ctx *context.APIContext) {
 	}
 
 	if err := issues_model.UpdateMilestone(ctx, milestone, oldIsClosed); err != nil {
-		ctx.Error(http.StatusInternalServerError, "UpdateMilestone", err)
+		ctx.APIErrorInternal(err)
 		return
 	}
 	ctx.JSON(http.StatusOK, convert.ToAPIMilestone(milestone))
@@ -256,8 +258,8 @@ func DeleteMilestone(ctx *context.APIContext) {
 	// responses:
 	//   "204":
 	//     "$ref": "#/responses/empty"
-	//   "404":
-	//     "$ref": "#/responses/notFound"
+	//   default:
+	//     "$ref": "#/responses/error"
 
 	m := getMilestoneByIDOrName(ctx)
 	if ctx.Written() {
@@ -265,7 +267,7 @@ func DeleteMilestone(ctx *context.APIContext) {
 	}
 
 	if err := issues_model.DeleteMilestoneByRepoID(ctx, ctx.Repo.Repository.ID, m.ID); err != nil {
-		ctx.Error(http.StatusInternalServerError, "DeleteMilestoneByRepoID", err)
+		ctx.APIErrorInternal(err)
 		return
 	}
 	ctx.Status(http.StatusNoContent)
@@ -273,7 +275,7 @@ func DeleteMilestone(ctx *context.APIContext) {
 
 // getMilestoneByIDOrName get milestone by ID and if not available by name
 func getMilestoneByIDOrName(ctx *context.APIContext) *issues_model.Milestone {
-	mile := ctx.Params(":id")
+	mile := ctx.PathParam("id")
 	mileID, _ := strconv.ParseInt(mile, 0, 64)
 
 	if mileID != 0 {
@@ -281,7 +283,7 @@ func getMilestoneByIDOrName(ctx *context.APIContext) *issues_model.Milestone {
 		if err == nil {
 			return milestone
 		} else if !issues_model.IsErrMilestoneNotExist(err) {
-			ctx.Error(http.StatusInternalServerError, "GetMilestoneByRepoID", err)
+			ctx.APIErrorInternal(err)
 			return nil
 		}
 	}
@@ -289,10 +291,10 @@ func getMilestoneByIDOrName(ctx *context.APIContext) *issues_model.Milestone {
 	milestone, err := issues_model.GetMilestoneByRepoIDANDName(ctx, ctx.Repo.Repository.ID, mile)
 	if err != nil {
 		if issues_model.IsErrMilestoneNotExist(err) {
-			ctx.NotFound()
+			ctx.APIErrorNotFound()
 			return nil
 		}
-		ctx.Error(http.StatusInternalServerError, "GetMilestoneByRepoID", err)
+		ctx.APIErrorInternal(err)
 		return nil
 	}
 

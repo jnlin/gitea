@@ -32,21 +32,15 @@ func (c *Context) Value(key any) any {
 }
 
 // ProcessContextKey is the key under which process contexts are stored
-var ProcessContextKey any = "process-context"
+var ProcessContextKey any = "process_context"
 
 // GetContext will return a process context if one exists
 func GetContext(ctx context.Context) *Context {
 	if pCtx, ok := ctx.(*Context); ok {
 		return pCtx
 	}
-	pCtxInterface := ctx.Value(ProcessContextKey)
-	if pCtxInterface == nil {
-		return nil
-	}
-	if pCtx, ok := pCtxInterface.(*Context); ok {
-		return pCtx
-	}
-	return nil
+	pCtx, _ := ctx.Value(ProcessContextKey).(*Context)
+	return pCtx
 }
 
 // GetPID returns the PID for this context

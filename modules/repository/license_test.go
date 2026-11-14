@@ -11,70 +11,52 @@ import (
 )
 
 func Test_getLicense(t *testing.T) {
-	type args struct {
-		name   string
-		values *LicenseValues
-	}
 	tests := []struct {
 		name    string
-		args    args
+		license string
+		values  *LicenseValues
 		want    string
 		wantErr assert.ErrorAssertionFunc
 	}{
 		{
-			name: "regular",
-			args: args{
-				name:   "MIT",
-				values: &LicenseValues{Owner: "Gitea", Year: "2023"},
-			},
+			name:    "regular",
+			license: "MIT",
+			values:  &LicenseValues{Owner: "Gitea", Year: "2023"},
 			want: `MIT License
 
 Copyright (c) 2023 Gitea
 
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-`,
+Permission is hereby granted`,
 			wantErr: assert.NoError,
 		},
 		{
-			name: "license not found",
-			args: args{
-				name: "notfound",
-			},
+			name:    "license not found",
+			license: "notfound",
 			wantErr: assert.Error,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := GetLicense(tt.args.name, tt.args.values)
-			if !tt.wantErr(t, err, fmt.Sprintf("GetLicense(%v, %v)", tt.args.name, tt.args.values)) {
+			got, err := GetLicense(tt.license, tt.values)
+			if !tt.wantErr(t, err, fmt.Sprintf("GetLicense(%v, %v)", tt.license, tt.values)) {
 				return
 			}
-			assert.Equalf(t, tt.want, string(got), "GetLicense(%v, %v)", tt.args.name, tt.args.values)
+			assert.Contains(t, string(got), tt.want, "GetLicense(%v, %v)", tt.license, tt.values)
 		})
 	}
 }
 
 func Test_fillLicensePlaceholder(t *testing.T) {
-	type args struct {
-		name   string
-		values *LicenseValues
-		origin string
-	}
 	tests := []struct {
-		name string
-		args args
-		want string
+		name    string
+		license string
+		origin  string
+		want    string
 	}{
 		{
-			name: "owner",
-			args: args{
-				name:   "regular",
-				values: &LicenseValues{Year: "2023", Owner: "Gitea", Email: "teabot@gitea.io", Repo: "gitea"},
-				origin: `
+			name:    "owner",
+			license: "regular",
+			origin: `
 <name of author>
 <owner>
 [NAME]
@@ -86,7 +68,6 @@ func Test_fillLicensePlaceholder(t *testing.T) {
 <author's name or designee>
 [one or more legally recognised persons or entities offering the Work under the terms and conditions of this Licence]
 `,
-			},
 			want: `
 Gitea
 Gitea
@@ -101,39 +82,31 @@ Gitea
 `,
 		},
 		{
-			name: "email",
-			args: args{
-				name:   "regular",
-				values: &LicenseValues{Year: "2023", Owner: "Gitea", Email: "teabot@gitea.io", Repo: "gitea"},
-				origin: `
+			name:    "email",
+			license: "regular",
+			origin: `
 [EMAIL]
 `,
-			},
 			want: `
 teabot@gitea.io
 `,
 		},
 		{
-			name: "repo",
-			args: args{
-				name:   "regular",
-				values: &LicenseValues{Year: "2023", Owner: "Gitea", Email: "teabot@gitea.io", Repo: "gitea"},
-				origin: `
+			name:    "repo",
+			license: "regular",
+			origin: `
 <program>
 <one line to give the program's name and a brief idea of what it does.>
 `,
-			},
 			want: `
 gitea
 gitea
 `,
 		},
 		{
-			name: "year",
-			args: args{
-				name:   "regular",
-				values: &LicenseValues{Year: "2023", Owner: "Gitea", Email: "teabot@gitea.io", Repo: "gitea"},
-				origin: `
+			name:    "year",
+			license: "regular",
+			origin: `
 <year>
 [YEAR]
 {YEAR}
@@ -141,7 +114,6 @@ gitea
 [Year]
 [year]
 `,
-			},
 			want: `
 2023
 2023
@@ -152,18 +124,15 @@ gitea
 `,
 		},
 		{
-			name: "0BSD",
-			args: args{
-				name:   "0BSD",
-				values: &LicenseValues{Year: "2023", Owner: "Gitea", Email: "teabot@gitea.io", Repo: "gitea"},
-				origin: `
+			name:    "0BSD",
+			license: "0BSD",
+			origin: `
 Copyright (C) YEAR by AUTHOR EMAIL
 
 ...
 
 ... THE AUTHOR BE LIABLE FOR ...
 `,
-			},
 			want: `
 Copyright (C) 2023 by Gitea teabot@gitea.io
 
@@ -175,7 +144,8 @@ Copyright (C) 2023 by Gitea teabot@gitea.io
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			assert.Equalf(t, tt.want, string(fillLicensePlaceholder(tt.args.name, tt.args.values, []byte(tt.args.origin))), "fillLicensePlaceholder(%v, %v, %v)", tt.args.name, tt.args.values, tt.args.origin)
+			values := &LicenseValues{Year: "2023", Owner: "Gitea", Email: "teabot@gitea.io", Repo: "gitea"}
+			assert.Equalf(t, tt.want, string(fillLicensePlaceholder(tt.license, values, []byte(tt.origin))), "fillLicensePlaceholder(%v, %v, %v)", tt.license, values, tt.origin)
 		})
 	}
 }

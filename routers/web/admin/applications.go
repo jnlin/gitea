@@ -4,26 +4,26 @@
 package admin
 
 import (
-	"fmt"
 	"net/http"
 
-	"code.gitea.io/gitea/models/auth"
-	"code.gitea.io/gitea/modules/base"
-	"code.gitea.io/gitea/modules/context"
-	"code.gitea.io/gitea/modules/setting"
-	user_setting "code.gitea.io/gitea/routers/web/user/setting"
+	"gitea.dev/models/auth"
+	"gitea.dev/models/db"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/templates"
+	user_setting "gitea.dev/routers/web/user/setting"
+	"gitea.dev/services/context"
 )
 
 var (
-	tplSettingsApplications          base.TplName = "admin/applications/list"
-	tplSettingsOauth2ApplicationEdit base.TplName = "admin/applications/oauth2_edit"
+	tplSettingsApplications          templates.TplName = "admin/applications/list"
+	tplSettingsOauth2ApplicationEdit templates.TplName = "admin/applications/oauth2_edit"
 )
 
 func newOAuth2CommonHandlers() *user_setting.OAuth2CommonHandlers {
 	return &user_setting.OAuth2CommonHandlers{
-		OwnerID:            0,
-		BasePathList:       fmt.Sprintf("%s/admin/applications", setting.AppSubURL),
-		BasePathEditPrefix: fmt.Sprintf("%s/admin/applications/oauth2", setting.AppSubURL),
+		Owner:              nil, // instance-wide
+		BasePathList:       setting.AppSubURL + "/-/admin/applications",
+		BasePathEditPrefix: setting.AppSubURL + "/-/admin/applications/oauth2",
 		TplAppEdit:         tplSettingsOauth2ApplicationEdit,
 	}
 }
@@ -33,9 +33,11 @@ func Applications(ctx *context.Context) {
 	ctx.Data["Title"] = ctx.Tr("settings.applications")
 	ctx.Data["PageIsAdminApplications"] = true
 
-	apps, err := auth.GetOAuth2ApplicationsByUserID(ctx, 0)
+	apps, err := db.Find[auth.OAuth2Application](ctx, auth.FindOAuth2ApplicationsOptions{
+		IsGlobal: true,
+	})
 	if err != nil {
-		ctx.ServerError("GetOAuth2ApplicationsByUserID", err)
+		ctx.ServerErrorAuto(err)
 		return
 	}
 	ctx.Data["Applications"] = apps
@@ -71,7 +73,7 @@ func EditApplicationPost(ctx *context.Context) {
 
 // ApplicationsRegenerateSecret handles the post request for regenerating the secret
 func ApplicationsRegenerateSecret(ctx *context.Context) {
-	ctx.Data["Title"] = ctx.Tr("settings")
+	ctx.Data["Title"] = ctx.Tr("settings_title")
 	ctx.Data["PageIsAdminApplications"] = true
 
 	oa := newOAuth2CommonHandlers()

@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto"
 	"errors"
 	"fmt"
 	"io"
@@ -14,19 +15,19 @@ import (
 	"strings"
 	"time"
 
-	packages_model "code.gitea.io/gitea/models/packages"
-	debian_model "code.gitea.io/gitea/models/packages/debian"
-	user_model "code.gitea.io/gitea/models/user"
-	packages_module "code.gitea.io/gitea/modules/packages"
-	debian_module "code.gitea.io/gitea/modules/packages/debian"
-	"code.gitea.io/gitea/modules/setting"
-	"code.gitea.io/gitea/modules/util"
-	packages_service "code.gitea.io/gitea/services/packages"
+	packages_model "gitea.dev/models/packages"
+	debian_model "gitea.dev/models/packages/debian"
+	user_model "gitea.dev/models/user"
+	packages_module "gitea.dev/modules/packages"
+	debian_module "gitea.dev/modules/packages/debian"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/util"
+	packages_service "gitea.dev/services/packages"
 
-	"github.com/keybase/go-crypto/openpgp"
-	"github.com/keybase/go-crypto/openpgp/armor"
-	"github.com/keybase/go-crypto/openpgp/clearsign"
-	"github.com/keybase/go-crypto/openpgp/packet"
+	"github.com/ProtonMail/go-crypto/openpgp"
+	"github.com/ProtonMail/go-crypto/openpgp/armor"
+	"github.com/ProtonMail/go-crypto/openpgp/clearsign"
+	"github.com/ProtonMail/go-crypto/openpgp/packet"
 	"github.com/ulikunitz/xz"
 )
 
@@ -38,36 +39,18 @@ func GetOrCreateRepositoryVersion(ctx context.Context, ownerID int64) (*packages
 
 // GetOrCreateKeyPair gets or creates the PGP keys used to sign repository files
 func GetOrCreateKeyPair(ctx context.Context, ownerID int64) (string, string, error) {
-	priv, err := user_model.GetSetting(ctx, ownerID, debian_module.SettingKeyPrivate)
-	if err != nil && !errors.Is(err, util.ErrNotExist) {
-		return "", "", err
-	}
-
-	pub, err := user_model.GetSetting(ctx, ownerID, debian_module.SettingKeyPublic)
-	if err != nil && !errors.Is(err, util.ErrNotExist) {
-		return "", "", err
-	}
-
-	if priv == "" || pub == "" {
-		priv, pub, err = generateKeypair()
-		if err != nil {
-			return "", "", err
-		}
-
-		if err := user_model.SetUserSetting(ctx, ownerID, debian_module.SettingKeyPrivate, priv); err != nil {
-			return "", "", err
-		}
-
-		if err := user_model.SetUserSetting(ctx, ownerID, debian_module.SettingKeyPublic, pub); err != nil {
-			return "", "", err
-		}
-	}
-
-	return priv, pub, nil
+	return packages_service.GetOrCreateKeyPair(ctx, ownerID, debian_module.SettingKeyPrivate, debian_module.SettingKeyPublic, generateKeypair)
 }
 
 func generateKeypair() (string, string, error) {
-	e, err := openpgp.NewEntity(setting.AppName, "Debian Registry", "", nil)
+	// Repository signing keys are long-lived and there is currently no rotation mechanism, choose stronger algorithms
+	cfg := &packet.Config{
+		RSABits:       4096,
+		DefaultHash:   crypto.SHA256,
+		DefaultCipher: packet.CipherAES256,
+	}
+
+	e, err := openpgp.NewEntity("", "Automatically generated Debian Registry Key; created "+time.Now().UTC().Format(time.RFC3339), "", cfg)
 	if err != nil {
 		return "", "", err
 	}
@@ -110,10 +93,7 @@ func BuildAllRepositoryFiles(ctx context.Context, ownerID int64) error {
 	}
 
 	for _, pf := range pfs {
-		if err := packages_model.DeleteAllProperties(ctx, packages_model.PropertyTypeFile, pf.ID); err != nil {
-			return err
-		}
-		if err := packages_model.DeleteFileByID(ctx, pf.ID); err != nil {
+		if err := packages_service.DeletePackageFile(ctx, pf); err != nil {
 			return err
 		}
 	}
@@ -165,29 +145,27 @@ func buildRepositoryFiles(ctx context.Context, ownerID int64, repoVersion *packa
 
 // https://wiki.debian.org/DebianRepository/Format#A.22Packages.22_Indices
 func buildPackagesIndices(ctx context.Context, ownerID int64, repoVersion *packages_model.PackageVersion, distribution, component, architecture string) error {
-	pfds, err := debian_model.SearchLatestPackages(ctx, &debian_model.PackageSearchOptions{
+	opts := &debian_model.PackageSearchOptions{
 		OwnerID:      ownerID,
 		Distribution: distribution,
 		Component:    component,
 		Architecture: architecture,
-	})
-	if err != nil {
-		return err
 	}
 
 	// Delete the package indices if there are no packages
-	if len(pfds) == 0 {
+	if has, err := debian_model.ExistPackages(ctx, opts); err != nil {
+		return err
+	} else if !has {
 		key := fmt.Sprintf("%s|%s|%s", distribution, component, architecture)
 		for _, filename := range []string{"Packages", "Packages.gz", "Packages.xz"} {
 			pf, err := packages_model.GetFileForVersionByName(ctx, repoVersion.ID, filename, key)
 			if err != nil && !errors.Is(err, util.ErrNotExist) {
 				return err
+			} else if pf == nil {
+				continue
 			}
 
-			if err := packages_model.DeleteAllProperties(ctx, packages_model.PropertyTypeFile, pf.ID); err != nil {
-				return err
-			}
-			if err := packages_model.DeleteFileByID(ctx, pf.ID); err != nil {
+			if err := packages_service.DeletePackageFile(ctx, pf); err != nil {
 				return err
 			}
 		}
@@ -196,16 +174,25 @@ func buildPackagesIndices(ctx context.Context, ownerID int64, repoVersion *packa
 	}
 
 	packagesContent, _ := packages_module.NewHashedBuffer()
+	defer packagesContent.Close()
 
 	packagesGzipContent, _ := packages_module.NewHashedBuffer()
+	defer packagesGzipContent.Close()
+
 	gzw := gzip.NewWriter(packagesGzipContent)
 
 	packagesXzContent, _ := packages_module.NewHashedBuffer()
+	defer packagesXzContent.Close()
+
 	xzw, _ := xz.NewWriter(packagesXzContent)
 
 	w := io.MultiWriter(packagesContent, gzw, xzw)
 
 	addSeparator := false
+	pfds, err := debian_model.SearchPackages(ctx, opts)
+	if err != nil {
+		return err
+	}
 	for _, pfd := range pfds {
 		if addSeparator {
 			fmt.Fprintln(w)
@@ -221,7 +208,6 @@ func buildPackagesIndices(ctx context.Context, ownerID int64, repoVersion *packa
 		fmt.Fprintf(w, "SHA256: %s\n", pfd.Blob.HashSHA256)
 		fmt.Fprintf(w, "SHA512: %s\n", pfd.Blob.HashSHA512)
 	}
-
 	gzw.Close()
 	xzw.Close()
 
@@ -233,7 +219,7 @@ func buildPackagesIndices(ctx context.Context, ownerID int64, repoVersion *packa
 		{"Packages.gz", packagesGzipContent},
 		{"Packages.xz", packagesXzContent},
 	} {
-		_, err = packages_service.AddFileToPackageVersionInternal(
+		_, err := packages_service.AddFileToPackageVersionInternal(
 			ctx,
 			repoVersion,
 			&packages_service.PackageFileCreationInfo{
@@ -280,12 +266,11 @@ func buildReleaseFiles(ctx context.Context, ownerID int64, repoVersion *packages
 			pf, err := packages_model.GetFileForVersionByName(ctx, repoVersion.ID, filename, distribution)
 			if err != nil && !errors.Is(err, util.ErrNotExist) {
 				return err
+			} else if pf == nil {
+				continue
 			}
 
-			if err := packages_model.DeleteAllProperties(ctx, packages_model.PropertyTypeFile, pf.ID); err != nil {
-				return err
-			}
-			if err := packages_model.DeleteFileByID(ctx, pf.ID); err != nil {
+			if err := packages_service.DeletePackageFile(ctx, pf); err != nil {
 				return err
 			}
 		}
@@ -323,6 +308,8 @@ func buildReleaseFiles(ctx context.Context, ownerID int64, repoVersion *packages
 	}
 
 	inReleaseContent, _ := packages_module.NewHashedBuffer()
+	defer inReleaseContent.Close()
+
 	sw, err := clearsign.Encode(inReleaseContent, e.PrivateKey, nil)
 	if err != nil {
 		return err
@@ -339,7 +326,7 @@ func buildReleaseFiles(ctx context.Context, ownerID int64, repoVersion *packages
 	fmt.Fprintf(w, "Components: %s\n", strings.Join(components, " "))
 	fmt.Fprintf(w, "Architectures: %s\n", strings.Join(architectures, " "))
 	fmt.Fprintf(w, "Date: %s\n", time.Now().UTC().Format(time.RFC1123))
-	fmt.Fprint(w, "Acquire-By-Hash: yes")
+	fmt.Fprint(w, "Acquire-By-Hash: yes\n")
 
 	pfds, err := packages_model.GetPackageFileDescriptors(ctx, pfs)
 	if err != nil {
@@ -367,11 +354,14 @@ func buildReleaseFiles(ctx context.Context, ownerID int64, repoVersion *packages
 	sw.Close()
 
 	releaseGpgContent, _ := packages_module.NewHashedBuffer()
+	defer releaseGpgContent.Close()
+
 	if err := openpgp.ArmoredDetachSign(releaseGpgContent, e, bytes.NewReader(buf.Bytes()), nil); err != nil {
 		return err
 	}
 
 	releaseContent, _ := packages_module.CreateHashedBufferFromReader(&buf)
+	defer releaseContent.Close()
 
 	for _, file := range []struct {
 		Name string

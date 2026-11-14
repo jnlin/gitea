@@ -6,53 +6,59 @@ package user
 
 import (
 	"bytes"
-	"fmt"
 	"net/http"
+	"path"
 	"regexp"
 	"slices"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 
-	activities_model "code.gitea.io/gitea/models/activities"
-	asymkey_model "code.gitea.io/gitea/models/asymkey"
-	"code.gitea.io/gitea/models/db"
-	issues_model "code.gitea.io/gitea/models/issues"
-	"code.gitea.io/gitea/models/organization"
-	repo_model "code.gitea.io/gitea/models/repo"
-	"code.gitea.io/gitea/models/unit"
-	user_model "code.gitea.io/gitea/models/user"
-	"code.gitea.io/gitea/modules/base"
-	"code.gitea.io/gitea/modules/container"
-	"code.gitea.io/gitea/modules/context"
-	issue_indexer "code.gitea.io/gitea/modules/indexer/issues"
-	"code.gitea.io/gitea/modules/json"
-	"code.gitea.io/gitea/modules/log"
-	"code.gitea.io/gitea/modules/markup"
-	"code.gitea.io/gitea/modules/markup/markdown"
-	"code.gitea.io/gitea/modules/setting"
-	"code.gitea.io/gitea/modules/util"
-	"code.gitea.io/gitea/routers/web/feed"
-	context_service "code.gitea.io/gitea/services/context"
-	issue_service "code.gitea.io/gitea/services/issue"
-	pull_service "code.gitea.io/gitea/services/pull"
+	activities_model "gitea.dev/models/activities"
+	asymkey_model "gitea.dev/models/asymkey"
+	"gitea.dev/models/db"
+	issues_model "gitea.dev/models/issues"
+	"gitea.dev/models/organization"
+	"gitea.dev/models/renderhelper"
+	repo_model "gitea.dev/models/repo"
+	"gitea.dev/models/unit"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/base"
+	"gitea.dev/modules/container"
+	"gitea.dev/modules/indexer"
+	issue_indexer "gitea.dev/modules/indexer/issues"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/markup/markdown"
+	"gitea.dev/modules/optional"
+	"gitea.dev/modules/setting"
+	"gitea.dev/modules/templates"
+	"gitea.dev/modules/util"
+	"gitea.dev/routers/web/feed"
+	"gitea.dev/routers/web/shared/issue"
+	"gitea.dev/routers/web/shared/user"
+	"gitea.dev/services/context"
+	feed_service "gitea.dev/services/feed"
+	issue_service "gitea.dev/services/issue"
+	pull_service "gitea.dev/services/pull"
 
-	"github.com/keybase/go-crypto/openpgp"
-	"github.com/keybase/go-crypto/openpgp/armor"
+	"github.com/ProtonMail/go-crypto/openpgp"
+	"github.com/ProtonMail/go-crypto/openpgp/armor"
+	"github.com/go-chi/chi/v5"
 	"xorm.io/builder"
 )
 
 const (
-	tplDashboard  base.TplName = "user/dashboard/dashboard"
-	tplIssues     base.TplName = "user/dashboard/issues"
-	tplMilestones base.TplName = "user/dashboard/milestones"
-	tplProfile    base.TplName = "user/profile"
+	tplDashboard  templates.TplName = "user/dashboard/dashboard"
+	tplIssues     templates.TplName = "user/dashboard/issues"
+	tplMilestones templates.TplName = "user/dashboard/milestones"
+	tplProfile    templates.TplName = "user/profile"
 )
 
-// getDashboardContextUser finds out which context user dashboard is being viewed as .
-func getDashboardContextUser(ctx *context.Context) *user_model.User {
+// prepareDashboardContextUserOrgTeams finds out which context user dashboard is being viewed as .
+func prepareDashboardContextUserOrgTeams(ctx *context.Context) *user_model.User {
 	ctxUser := ctx.Doer
-	orgName := ctx.Params(":org")
+	orgName := ctx.PathParam("org")
 	if len(orgName) > 0 {
 		ctxUser = ctx.Org.Organization.AsUser()
 		ctx.Data["Teams"] = ctx.Org.Teams
@@ -61,7 +67,7 @@ func getDashboardContextUser(ctx *context.Context) *user_model.User {
 
 	orgs, err := organization.GetUserOrgsList(ctx, ctx.Doer)
 	if err != nil {
-		ctx.ServerError("GetUserOrgsList", err)
+		ctx.ServerErrorAuto(err)
 		return nil
 	}
 	ctx.Data["Orgs"] = orgs
@@ -71,7 +77,7 @@ func getDashboardContextUser(ctx *context.Context) *user_model.User {
 
 // Dashboard render the dashboard page
 func Dashboard(ctx *context.Context) {
-	ctxUser := getDashboardContextUser(ctx)
+	ctxUser := prepareDashboardContextUserOrgTeams(ctx)
 	if ctx.Written() {
 		return
 	}
@@ -86,7 +92,7 @@ func Dashboard(ctx *context.Context) {
 		page = 1
 	}
 
-	ctx.Data["Title"] = ctxUser.DisplayName() + " - " + ctx.Tr("dashboard")
+	ctx.Data["Title"] = ctxUser.DisplayName() + " - " + ctx.Locale.TrString("dashboard")
 	ctx.Data["PageIsDashboard"] = true
 	ctx.Data["PageIsNews"] = true
 	cnt, _ := organization.GetOrganizationCount(ctx, ctxUser)
@@ -104,17 +110,10 @@ func Dashboard(ctx *context.Context) {
 		"uid":         uid,
 	}
 
-	if setting.Service.EnableUserHeatmap {
-		data, err := activities_model.GetUserHeatmapDataByUserTeam(ctx, ctxUser, ctx.Org.Team, ctx.Doer)
-		if err != nil {
-			ctx.ServerError("GetUserHeatmapDataByUserTeam", err)
-			return
-		}
-		ctx.Data["HeatmapData"] = data
-		ctx.Data["HeatmapTotalContributions"] = activities_model.GetTotalContributionsInHeatmap(data)
-	}
+	prepareHeatmapURL(ctx)
 
-	feeds, count, err := activities_model.GetFeeds(ctx, activities_model.GetFeedsOptions{
+	pageSize := setting.UI.FeedPagingNum
+	feeds, count, err := feed_service.GetFeedsForDashboard(ctx, activities_model.GetFeedsOptions{
 		RequestedUser:   ctxUser,
 		RequestedTeam:   ctx.Org.Team,
 		Actor:           ctx.Doer,
@@ -122,21 +121,18 @@ func Dashboard(ctx *context.Context) {
 		OnlyPerformedBy: false,
 		IncludeDeleted:  false,
 		Date:            ctx.FormString("date"),
-		ListOptions: db.ListOptions{
-			Page:     page,
-			PageSize: setting.UI.FeedPagingNum,
-		},
+		ListOptions:     db.ListOptions{Page: page, PageSize: pageSize},
 	})
 	if err != nil {
-		ctx.ServerError("GetFeeds", err)
+		ctx.ServerErrorAuto(err)
 		return
 	}
 
-	ctx.Data["Feeds"] = feeds
-
-	pager := context.NewPagination(int(count), setting.UI.FeedPagingNum, page, 5)
-	pager.AddParam(ctx, "date", "Date")
+	// FIXME: UNLIMITE-PAGING-ONE-MORE-ROW: here is still an edge case: when curRows==pagingNum, then the "next page" will be an empty page.
+	// Ideally we should query one more row to determine if there is really a next page, but it's impossible in current framework.
+	pager := context.NewPagerBuilder(ctx).TotalCount(count).PerPageLimit(pageSize).CurPage(page).Build().WithUnlimitedPaging(len(feeds), len(feeds) == pageSize)
 	ctx.Data["Page"] = pager
+	ctx.Data["Feeds"] = feeds
 
 	ctx.HTML(http.StatusOK, tplDashboard)
 }
@@ -152,7 +148,7 @@ func Milestones(ctx *context.Context) {
 	ctx.Data["Title"] = ctx.Tr("milestones")
 	ctx.Data["PageIsMilestonesDashboard"] = true
 
-	ctxUser := getDashboardContextUser(ctx)
+	ctxUser := prepareDashboardContextUserOrgTeams(ctx)
 	if ctx.Written() {
 		return
 	}
@@ -163,8 +159,8 @@ func Milestones(ctx *context.Context) {
 		Private:       true,
 		AllPublic:     false, // Include also all public repositories of users and public organisations
 		AllLimited:    false, // Include also all public repositories of limited organisations
-		Archived:      util.OptionalBoolFalse,
-		HasMilestones: util.OptionalBoolTrue, // Just needs display repos has milestones
+		Archived:      optional.Some(false),
+		HasMilestones: optional.Some(true), // Just needs display repos has milestones
 	}
 
 	if ctxUser.IsOrganization() && ctx.Org.Team != nil {
@@ -172,7 +168,7 @@ func Milestones(ctx *context.Context) {
 	}
 
 	var (
-		userRepoCond = repo_model.SearchRepositoryCondition(&repoOpts) // all repo condition user could visit
+		userRepoCond = repo_model.SearchRepositoryCondition(repoOpts) // all repo condition user could visit
 		repoCond     = userRepoCond
 		repoIDs      []int64
 
@@ -188,12 +184,12 @@ func Milestones(ctx *context.Context) {
 	}
 
 	if len(reposQuery) != 0 {
-		if issueReposQueryPattern.MatchString(reposQuery) {
+		if issueReposQueryPattern().MatchString(reposQuery) {
 			// remove "[" and "]" from string
 			reposQuery = reposQuery[1 : len(reposQuery)-1]
 			// for each ID (delimiter ",") add to int to repoIDs
 
-			for _, rID := range strings.Split(reposQuery, ",") {
+			for rID := range strings.SplitSeq(reposQuery, ",") {
 				// Ensure nonempty string entries
 				if rID != "" && rID != "0" {
 					rIDint64, err := strconv.ParseInt(rID, 10, 64)
@@ -213,52 +209,62 @@ func Milestones(ctx *context.Context) {
 		}
 	}
 
-	counts, err := issues_model.CountMilestonesByRepoCondAndKw(ctx, userRepoCond, keyword, isShowClosed)
+	counts, err := issues_model.CountMilestonesMap(ctx, issues_model.FindMilestoneOptions{
+		RepoCond: userRepoCond,
+		Name:     keyword,
+		IsClosed: optional.Some(isShowClosed),
+	})
 	if err != nil {
-		ctx.ServerError("CountMilestonesByRepoIDs", err)
+		ctx.ServerErrorAuto(err)
 		return
 	}
 
-	milestones, err := issues_model.SearchMilestones(ctx, repoCond, page, isShowClosed, sortType, keyword)
+	milestones, err := db.Find[issues_model.Milestone](ctx, issues_model.FindMilestoneOptions{
+		ListOptions: db.ListOptions{
+			Page:     page,
+			PageSize: setting.UI.IssuePagingNum,
+		},
+		RepoCond: repoCond,
+		IsClosed: optional.Some(isShowClosed),
+		SortType: sortType,
+		Name:     keyword,
+	})
 	if err != nil {
-		ctx.ServerError("SearchMilestones", err)
+		ctx.ServerErrorAuto(err)
 		return
 	}
 
-	showRepos, _, err := repo_model.SearchRepositoryByCondition(ctx, &repoOpts, userRepoCond, false)
+	showRepos, _, err := repo_model.SearchRepositoryByCondition(ctx, repoOpts, userRepoCond, false)
 	if err != nil {
-		ctx.ServerError("SearchRepositoryByCondition", err)
+		ctx.ServerErrorAuto(err)
 		return
 	}
 	sort.Sort(showRepos)
 
+	repoByID := make(map[int64]*repo_model.Repository, len(showRepos))
+	for _, repo := range showRepos {
+		repoByID[repo.ID] = repo
+	}
+
 	for i := 0; i < len(milestones); {
-		for _, repo := range showRepos {
-			if milestones[i].RepoID == repo.ID {
-				milestones[i].Repo = repo
-				break
-			}
-		}
+		milestones[i].Repo = repoByID[milestones[i].RepoID]
 		if milestones[i].Repo == nil {
 			log.Warn("Cannot find milestone %d 's repository %d", milestones[i].ID, milestones[i].RepoID)
 			milestones = append(milestones[:i], milestones[i+1:]...)
 			continue
 		}
 
-		milestones[i].RenderedContent, err = markdown.RenderString(&markup.RenderContext{
-			URLPrefix: milestones[i].Repo.Link(),
-			Metas:     milestones[i].Repo.ComposeMetas(),
-			Ctx:       ctx,
-		}, milestones[i].Content)
+		rctx := renderhelper.NewRenderContextRepoComment(ctx, milestones[i].Repo)
+		milestones[i].RenderedContent, err = markdown.RenderString(rctx, milestones[i].Content)
 		if err != nil {
-			ctx.ServerError("RenderString", err)
+			ctx.ServerErrorAuto(err)
 			return
 		}
 
 		if milestones[i].Repo.IsTimetrackerEnabled(ctx) {
 			err := milestones[i].LoadTotalTrackedTime(ctx)
 			if err != nil {
-				ctx.ServerError("LoadTotalTrackedTime", err)
+				ctx.ServerErrorAuto(err)
 				return
 			}
 		}
@@ -267,7 +273,7 @@ func Milestones(ctx *context.Context) {
 
 	milestoneStats, err := issues_model.GetMilestonesStatsByRepoCondAndKw(ctx, repoCond, keyword)
 	if err != nil {
-		ctx.ServerError("GetMilestoneStats", err)
+		ctx.ServerErrorAuto(err)
 		return
 	}
 
@@ -277,33 +283,33 @@ func Milestones(ctx *context.Context) {
 	} else {
 		totalMilestoneStats, err = issues_model.GetMilestonesStatsByRepoCondAndKw(ctx, userRepoCond, keyword)
 		if err != nil {
-			ctx.ServerError("GetMilestoneStats", err)
+			ctx.ServerErrorAuto(err)
 			return
 		}
 	}
 
-	showRepoIds := make(container.Set[int64], len(showRepos))
+	showRepoIDs := make(container.Set[int64], len(showRepos))
 	for _, repo := range showRepos {
 		if repo.ID > 0 {
-			showRepoIds.Add(repo.ID)
+			showRepoIDs.Add(repo.ID)
 		}
 	}
 	if len(repoIDs) == 0 {
-		repoIDs = showRepoIds.Values()
+		repoIDs = showRepoIDs.Values()
 	}
 	repoIDs = slices.DeleteFunc(repoIDs, func(v int64) bool {
-		return !showRepoIds.Contains(v)
+		return !showRepoIDs.Contains(v)
 	})
 
-	var pagerCount int
+	var pagerCount int64
 	if isShowClosed {
 		ctx.Data["State"] = "closed"
 		ctx.Data["Total"] = totalMilestoneStats.ClosedCount
-		pagerCount = int(milestoneStats.ClosedCount)
+		pagerCount = milestoneStats.ClosedCount
 	} else {
 		ctx.Data["State"] = "open"
 		ctx.Data["Total"] = totalMilestoneStats.OpenCount
-		pagerCount = int(milestoneStats.OpenCount)
+		pagerCount = milestoneStats.OpenCount
 	}
 
 	ctx.Data["Milestones"] = milestones
@@ -315,11 +321,7 @@ func Milestones(ctx *context.Context) {
 	ctx.Data["RepoIDs"] = repoIDs
 	ctx.Data["IsShowClosed"] = isShowClosed
 
-	pager := context.NewPagination(pagerCount, setting.UI.IssuePagingNum, page, 5)
-	pager.AddParam(ctx, "q", "Keyword")
-	pager.AddParam(ctx, "repos", "RepoIDs")
-	pager.AddParam(ctx, "sort", "SortType")
-	pager.AddParam(ctx, "state", "State")
+	pager := context.NewPagerBuilder(ctx).TotalCount(pagerCount).PerPageLimit(setting.UI.IssuePagingNum).CurPage(page).Build()
 	ctx.Data["Page"] = pager
 
 	ctx.HTML(http.StatusOK, tplMilestones)
@@ -335,7 +337,6 @@ func Pulls(ctx *context.Context) {
 
 	ctx.Data["Title"] = ctx.Tr("pull_requests")
 	ctx.Data["PageIsPulls"] = true
-	ctx.Data["SingleRepoAction"] = "pull"
 	buildIssueOverview(ctx, unit.TypePullRequests)
 }
 
@@ -349,12 +350,13 @@ func Issues(ctx *context.Context) {
 
 	ctx.Data["Title"] = ctx.Tr("issues")
 	ctx.Data["PageIsIssues"] = true
-	ctx.Data["SingleRepoAction"] = "issue"
 	buildIssueOverview(ctx, unit.TypeIssues)
 }
 
 // Regexp for repos query
-var issueReposQueryPattern = regexp.MustCompile(`^\[\d+(,\d+)*,?\]$`)
+var issueReposQueryPattern = sync.OnceValue(func() *regexp.Regexp {
+	return regexp.MustCompile(`^\[\d+(,\d+)*,?\]$`)
+})
 
 func buildIssueOverview(ctx *context.Context, unitType unit.Type) {
 	// ----------------------------------------------------
@@ -362,21 +364,13 @@ func buildIssueOverview(ctx *context.Context, unitType unit.Type) {
 	// Return with NotFound or ServerError if unsuccessful.
 	// ----------------------------------------------------
 
-	ctxUser := getDashboardContextUser(ctx)
+	ctxUser := prepareDashboardContextUserOrgTeams(ctx)
 	if ctx.Written() {
 		return
 	}
 
-	var (
-		viewType   string
-		sortType   = ctx.FormString("sort")
-		filterMode int
-	)
-
 	// Default to recently updated, unlike repository issues list
-	if sortType == "" {
-		sortType = "recentupdate"
-	}
+	sortType := util.IfZero(ctx.FormString("sort"), "recentupdate")
 
 	// --------------------------------------------------------------------------------
 	// Distinguish User from Organization.
@@ -391,7 +385,8 @@ func buildIssueOverview(ctx *context.Context, unitType unit.Type) {
 
 	// TODO: distinguish during routing
 
-	viewType = ctx.FormString("type")
+	viewType := ctx.FormString("type")
+	var filterMode int
 	switch viewType {
 	case "assigned":
 		filterMode = issues_model.FilterModeAssign
@@ -410,6 +405,13 @@ func buildIssueOverview(ctx *context.Context, unitType unit.Type) {
 		viewType = "your_repositories"
 	}
 
+	isPullList := unitType == unit.TypePullRequests
+	opts := &issues_model.IssuesOptions{
+		IsPull:     optional.Some(isPullList),
+		SortType:   sortType,
+		IsArchived: optional.Some(false),
+		Doer:       ctx.Doer,
+	}
 	// --------------------------------------------------------------------------
 	// Build opts (IssuesOptions), which contains filter information.
 	// Will eventually be used to retrieve issues relevant for the overview page.
@@ -419,22 +421,26 @@ func buildIssueOverview(ctx *context.Context, unitType unit.Type) {
 	// --------------------------------------------------------------------------
 
 	// Get repository IDs where User/Org/Team has access.
-	var team *organization.Team
-	var org *organization.Organization
-	if ctx.Org != nil {
-		org = ctx.Org.Organization
-		team = ctx.Org.Team
-	}
+	if ctx.Org != nil && ctx.Org.Organization != nil {
+		opts.Owner = ctx.Org.Organization.AsUser()
+		opts.Team = ctx.Org.Team
 
-	isPullList := unitType == unit.TypePullRequests
-	opts := &issues_model.IssuesOptions{
-		IsPull:     util.OptionalBoolOf(isPullList),
-		SortType:   sortType,
-		IsArchived: util.OptionalBoolFalse,
-		Org:        org,
-		Team:       team,
-		User:       ctx.Doer,
+		issue.PrepareFilterIssueLabels(ctx, 0, ctx.Org.Organization.AsUser())
+		if ctx.Written() {
+			return
+		}
 	}
+	// Get filter by author id & assignee id
+	// the existing "/posters" handlers doesn't work for this case, it is unable to list the related users correctly.
+	// In the future, we need something like github: "author:user1" to accept usernames directly.
+	posterUsername := ctx.FormString("poster")
+	ctx.Data["FilterPosterUsername"] = posterUsername
+	opts.PosterID = user.GetPossibleDoerUserIDByName(ctx, posterUsername)
+	assigneeUsername := ctx.FormString("assignee")
+	ctx.Data["FilterAssigneeUsername"] = assigneeUsername
+	opts.AssigneeID = user.GetPossibleDoerUserIDByName(ctx, assigneeUsername)
+
+	searchMode := ctx.FormString("search_mode")
 
 	// Search all repositories which
 	//
@@ -448,24 +454,24 @@ func buildIssueOverview(ctx *context.Context, unitType unit.Type) {
 	// As team:
 	// - Team org's owns the repository.
 	// - Team has read permission to repository.
-	repoOpts := &repo_model.SearchRepoOptions{
+	repoOpts := repo_model.SearchRepoOptions{
 		Actor:       ctx.Doer,
 		OwnerID:     ctxUser.ID,
 		Private:     true,
 		AllPublic:   false,
 		AllLimited:  false,
-		Collaborate: util.OptionalBoolNone,
+		Collaborate: optional.None[bool](),
 		UnitType:    unitType,
-		Archived:    util.OptionalBoolFalse,
+		Archived:    optional.Some(false),
 	}
-	if team != nil {
-		repoOpts.TeamID = team.ID
+	if opts.Team != nil {
+		repoOpts.TeamID = opts.Team.ID
 	}
 	accessibleRepos := container.Set[int64]{}
 	{
-		ids, _, err := repo_model.SearchRepositoryIDs(repoOpts)
+		ids, _, err := repo_model.SearchRepositoryIDs(ctx, repoOpts)
 		if err != nil {
-			ctx.ServerError("SearchRepositoryIDs", err)
+			ctx.ServerErrorAuto(err)
 			return
 		}
 		accessibleRepos.AddMultiple(ids...)
@@ -475,14 +481,21 @@ func buildIssueOverview(ctx *context.Context, unitType unit.Type) {
 			opts.RepoIDs = []int64{0}
 		}
 	}
+	if ctx.Doer.ID == ctxUser.ID && filterMode != issues_model.FilterModeYourRepositories {
+		// If the doer is the same as the context user, which means the doer is viewing his own dashboard,
+		// it's not enough to show the repos that the doer owns or has been explicitly granted access to,
+		// because the doer may create issues or be mentioned in any public repo.
+		// So we need search issues in all public repos.
+		opts.AllPublic = true
+	}
 
 	switch filterMode {
 	case issues_model.FilterModeAll:
 	case issues_model.FilterModeYourRepositories:
 	case issues_model.FilterModeAssign:
-		opts.AssigneeID = ctx.Doer.ID
+		opts.AssigneeID = strconv.FormatInt(ctx.Doer.ID, 10)
 	case issues_model.FilterModeCreate:
-		opts.PosterID = ctx.Doer.ID
+		opts.PosterID = strconv.FormatInt(ctx.Doer.ID, 10)
 	case issues_model.FilterModeMention:
 		opts.MentionedID = ctx.Doer.ID
 	case issues_model.FilterModeReviewRequested:
@@ -497,21 +510,10 @@ func buildIssueOverview(ctx *context.Context, unitType unit.Type) {
 
 	// Educated guess: Do or don't show closed issues.
 	isShowClosed := ctx.FormString("state") == "closed"
-	opts.IsClosed = util.OptionalBoolOf(isShowClosed)
-
-	// Filter repos and count issues in them. Count will be used later.
-	// USING NON-FINAL STATE OF opts FOR A QUERY.
-	issueCountByRepo, err := issue_indexer.CountIssuesByRepo(ctx, issue_indexer.ToSearchOptions(keyword, opts))
-	if err != nil {
-		ctx.ServerError("CountIssuesByRepo", err)
-		return
-	}
+	opts.IsClosed = optional.Some(isShowClosed)
 
 	// Make sure page number is at least 1. Will be posted to ctx.Data.
-	page := ctx.FormInt("page")
-	if page <= 1 {
-		page = 1
-	}
+	page := max(ctx.FormInt("page"), 1)
 	opts.Paginator = &db.ListOptions{
 		Page:     page,
 		PageSize: setting.UI.IssuePagingNum,
@@ -519,27 +521,13 @@ func buildIssueOverview(ctx *context.Context, unitType unit.Type) {
 
 	// Get IDs for labels (a filter option for issues/pulls).
 	// Required for IssuesOptions.
-	var labelIDs []int64
 	selectedLabels := ctx.FormString("labels")
 	if len(selectedLabels) > 0 && selectedLabels != "0" {
 		var err error
-		labelIDs, err = base.StringsToInt64s(strings.Split(selectedLabels, ","))
+		opts.LabelIDs, err = base.StringsToInt64s(strings.Split(selectedLabels, ","))
 		if err != nil {
-			ctx.ServerError("StringsToInt64s", err)
-			return
+			ctx.Flash.Error(ctx.Tr("invalid_data", selectedLabels), true)
 		}
-	}
-	opts.LabelIDs = labelIDs
-
-	// Parse ctx.FormString("repos") and remember matched repo IDs for later.
-	// Gets set when clicking filters on the issues overview page.
-	selectedRepoIDs := getRepoIDs(ctx.FormString("repos"))
-	// Remove repo IDs that are not accessible to the user.
-	selectedRepoIDs = slices.DeleteFunc(selectedRepoIDs, func(v int64) bool {
-		return !accessibleRepos.Contains(v)
-	})
-	if len(selectedRepoIDs) > 0 {
-		opts.RepoIDs = selectedRepoIDs
 	}
 
 	// ------------------------------
@@ -550,93 +538,47 @@ func buildIssueOverview(ctx *context.Context, unitType unit.Type) {
 	// USING FINAL STATE OF opts FOR A QUERY.
 	var issues issues_model.IssueList
 	{
-		issueIDs, _, err := issue_indexer.SearchIssues(ctx, issue_indexer.ToSearchOptions(keyword, opts))
+		issueIDs, _, err := issue_indexer.SearchIssues(ctx, issue_indexer.ToSearchOptions(keyword, opts).Copy(
+			func(o *issue_indexer.SearchOptions) {
+				o.SearchMode = indexer.SearchModeType(searchMode)
+			},
+		))
 		if err != nil {
-			ctx.ServerError("issueIDsFromSearch", err)
+			ctx.ServerErrorAuto(err)
 			return
 		}
 		issues, err = issues_model.GetIssuesByIDs(ctx, issueIDs, true)
 		if err != nil {
-			ctx.ServerError("GetIssuesByIDs", err)
+			ctx.ServerErrorAuto(err)
 			return
 		}
 	}
 
-	// ----------------------------------
-	// Add repository pointers to Issues.
-	// ----------------------------------
-
-	// Remove repositories that should not be shown,
-	// which are repositories that have no issues and are not selected by the user.
-	selectedRepos := container.SetOf(selectedRepoIDs...)
-	for k, v := range issueCountByRepo {
-		if v == 0 && !selectedRepos.Contains(k) {
-			delete(issueCountByRepo, k)
-		}
-	}
-
-	// showReposMap maps repository IDs to their Repository pointers.
-	showReposMap, err := loadRepoByIDs(ctxUser, issueCountByRepo, unitType)
+	commitStatuses, lastStatus, err := pull_service.GetIssuesAllCommitStatus(ctx, ctx.Doer, issues)
 	if err != nil {
-		if repo_model.IsErrRepoNotExist(err) {
-			ctx.NotFound("GetRepositoryByID", err)
-			return
-		}
-		ctx.ServerError("loadRepoByIDs", err)
-		return
-	}
-
-	// a RepositoryList
-	showRepos := repo_model.RepositoryListOfMap(showReposMap)
-	sort.Sort(showRepos)
-
-	// maps pull request IDs to their CommitStatus. Will be posted to ctx.Data.
-	for _, issue := range issues {
-		if issue.Repo == nil {
-			issue.Repo = showReposMap[issue.RepoID]
-		}
-	}
-
-	commitStatuses, lastStatus, err := pull_service.GetIssuesAllCommitStatus(ctx, issues)
-	if err != nil {
-		ctx.ServerError("GetIssuesLastCommitStatus", err)
+		ctx.ServerErrorAuto(err)
 		return
 	}
 
 	// -------------------------------
 	// Fill stats to post to ctx.Data.
 	// -------------------------------
-	issueStats, err := getUserIssueStats(ctx, filterMode, issue_indexer.ToSearchOptions(keyword, opts), ctx.Doer.ID)
+	issueStats, err := getUserIssueStats(ctx, ctxUser, filterMode, issue_indexer.ToSearchOptions(keyword, opts).Copy(
+		func(o *issue_indexer.SearchOptions) {
+			o.SearchMode = indexer.SearchModeType(searchMode)
+		},
+	))
 	if err != nil {
-		ctx.ServerError("getUserIssueStats", err)
+		ctx.ServerErrorAuto(err)
 		return
 	}
 
 	// Will be posted to ctx.Data.
-	var shownIssues int
+	var shownIssues int64
 	if !isShowClosed {
-		shownIssues = int(issueStats.OpenCount)
+		shownIssues = issueStats.OpenCount
 	} else {
-		shownIssues = int(issueStats.ClosedCount)
-	}
-	if len(opts.RepoIDs) != 0 {
-		shownIssues = 0
-		for _, repoID := range opts.RepoIDs {
-			shownIssues += int(issueCountByRepo[repoID])
-		}
-	}
-
-	var allIssueCount int64
-	for _, issueCount := range issueCountByRepo {
-		allIssueCount += issueCount
-	}
-	ctx.Data["TotalIssueCount"] = allIssueCount
-
-	if len(opts.RepoIDs) == 1 {
-		repo := showReposMap[opts.RepoIDs[0]]
-		if repo != nil {
-			ctx.Data["SingleRepoLink"] = repo.Link()
-		}
+		shownIssues = issueStats.ClosedCount
 	}
 
 	ctx.Data["IsShowClosed"] = isShowClosed
@@ -644,14 +586,14 @@ func buildIssueOverview(ctx *context.Context, unitType unit.Type) {
 	ctx.Data["IssueRefEndNames"], ctx.Data["IssueRefURLs"] = issue_service.GetRefEndNamesAndURLs(issues, ctx.FormString("RepoLink"))
 
 	if err := issues.LoadAttributes(ctx); err != nil {
-		ctx.ServerError("issues.LoadAttributes", err)
+		ctx.ServerErrorAuto(err)
 		return
 	}
 	ctx.Data["Issues"] = issues
 
 	approvalCounts, err := issues.GetApprovalCounts(ctx)
 	if err != nil {
-		ctx.ServerError("ApprovalCounts", err)
+		ctx.ServerErrorAuto(err)
 		return
 	}
 	ctx.Data["ApprovalCounts"] = func(issueID int64, typ string) int64 {
@@ -660,9 +602,10 @@ func buildIssueOverview(ctx *context.Context, unitType unit.Type) {
 			return 0
 		}
 		reviewTyp := issues_model.ReviewTypeApprove
-		if typ == "reject" {
+		switch typ {
+		case "reject":
 			reviewTyp = issues_model.ReviewTypeReject
-		} else if typ == "waiting" {
+		case "waiting":
 			reviewTyp = issues_model.ReviewTypeRequest
 		}
 		for _, count := range counts {
@@ -674,14 +617,12 @@ func buildIssueOverview(ctx *context.Context, unitType unit.Type) {
 	}
 	ctx.Data["CommitLastStatus"] = lastStatus
 	ctx.Data["CommitStatuses"] = commitStatuses
-	ctx.Data["Repos"] = showRepos
-	ctx.Data["Counts"] = issueCountByRepo
 	ctx.Data["IssueStats"] = issueStats
 	ctx.Data["ViewType"] = viewType
 	ctx.Data["SortType"] = sortType
-	ctx.Data["RepoIDs"] = selectedRepoIDs
 	ctx.Data["IsShowClosed"] = isShowClosed
-	ctx.Data["SelectLabels"] = selectedLabels
+	ctx.Data["SearchModes"] = issue_indexer.SupportedSearchModes()
+	ctx.Data["SelectedSearchMode"] = ctx.FormTrim("search_mode")
 
 	if isShowClosed {
 		ctx.Data["State"] = "closed"
@@ -689,84 +630,29 @@ func buildIssueOverview(ctx *context.Context, unitType unit.Type) {
 		ctx.Data["State"] = "open"
 	}
 
-	// Convert []int64 to string
-	reposParam, _ := json.Marshal(opts.RepoIDs)
-
-	ctx.Data["ReposParam"] = string(reposParam)
-
-	pager := context.NewPagination(shownIssues, setting.UI.IssuePagingNum, page, 5)
-	pager.AddParam(ctx, "q", "Keyword")
-	pager.AddParam(ctx, "type", "ViewType")
-	pager.AddParam(ctx, "repos", "ReposParam")
-	pager.AddParam(ctx, "sort", "SortType")
-	pager.AddParam(ctx, "state", "State")
-	pager.AddParam(ctx, "labels", "SelectLabels")
-	pager.AddParam(ctx, "milestone", "MilestoneID")
-	pager.AddParam(ctx, "assignee", "AssigneeID")
+	pager := context.NewPagerBuilder(ctx).TotalCount(shownIssues).PerPageLimit(setting.UI.IssuePagingNum).CurPage(page).Build()
 	ctx.Data["Page"] = pager
 
 	ctx.HTML(http.StatusOK, tplIssues)
 }
 
-func getRepoIDs(reposQuery string) []int64 {
-	if len(reposQuery) == 0 || reposQuery == "[]" {
-		return []int64{}
-	}
-	if !issueReposQueryPattern.MatchString(reposQuery) {
-		log.Warn("issueReposQueryPattern does not match query: %q", reposQuery)
-		return []int64{}
-	}
-
-	var repoIDs []int64
-	// remove "[" and "]" from string
-	reposQuery = reposQuery[1 : len(reposQuery)-1]
-	// for each ID (delimiter ",") add to int to repoIDs
-	for _, rID := range strings.Split(reposQuery, ",") {
-		// Ensure nonempty string entries
-		if rID != "" && rID != "0" {
-			rIDint64, err := strconv.ParseInt(rID, 10, 64)
-			if err == nil {
-				repoIDs = append(repoIDs, rIDint64)
-			}
-		}
-	}
-
-	return repoIDs
-}
-
-func loadRepoByIDs(ctxUser *user_model.User, issueCountByRepo map[int64]int64, unitType unit.Type) (map[int64]*repo_model.Repository, error) {
-	totalRes := make(map[int64]*repo_model.Repository, len(issueCountByRepo))
-	repoIDs := make([]int64, 0, 500)
-	for id := range issueCountByRepo {
-		if id <= 0 {
-			continue
-		}
-		repoIDs = append(repoIDs, id)
-		if len(repoIDs) == 500 {
-			if err := repo_model.FindReposMapByIDs(repoIDs, totalRes); err != nil {
-				return nil, err
-			}
-			repoIDs = repoIDs[:0]
-		}
-	}
-	if len(repoIDs) > 0 {
-		if err := repo_model.FindReposMapByIDs(repoIDs, totalRes); err != nil {
-			return nil, err
-		}
-	}
-	return totalRes, nil
-}
-
 // ShowSSHKeys output all the ssh keys of user by uid
 func ShowSSHKeys(ctx *context.Context) {
-	keys, err := asymkey_model.ListPublicKeys(ctx.ContextUser.ID, db.ListOptions{})
+	keys, err := db.Find[asymkey_model.PublicKey](ctx, asymkey_model.FindPublicKeyOptions{
+		OwnerID: ctx.ContextUser.ID,
+	})
 	if err != nil {
-		ctx.ServerError("ListPublicKeys", err)
+		ctx.ServerErrorAuto(err)
 		return
 	}
 
 	var buf bytes.Buffer
+	// "authorized_keys" file format: "#" followed by comment line per key
+	buf.WriteString("# Gitea isn't a key server. The keys are exported as the user uploaded and might not have been fully verified.\n")
 	for i := range keys {
+		if keys[i].Type == asymkey_model.KeyTypePrincipal {
+			continue // SSH principal keys are not for signing or authentication
+		}
 		buf.WriteString(keys[i].OmitEmail())
 		buf.WriteString("\n")
 	}
@@ -775,22 +661,25 @@ func ShowSSHKeys(ctx *context.Context) {
 
 // ShowGPGKeys output all the public GPG keys of user by uid
 func ShowGPGKeys(ctx *context.Context) {
-	keys, err := asymkey_model.ListGPGKeys(ctx, ctx.ContextUser.ID, db.ListOptions{})
+	keys, err := db.Find[asymkey_model.GPGKey](ctx, asymkey_model.FindGPGKeyOptions{
+		ListOptions: db.ListOptionsAll,
+		OwnerID:     ctx.ContextUser.ID,
+	})
 	if err != nil {
-		ctx.ServerError("ListGPGKeys", err)
+		ctx.ServerErrorAuto(err)
 		return
 	}
 
 	entities := make([]*openpgp.Entity, 0)
 	failedEntitiesID := make([]string, 0)
 	for _, k := range keys {
-		e, err := asymkey_model.GPGKeyToEntity(k)
+		e, err := asymkey_model.GPGKeyToEntity(ctx, k)
 		if err != nil {
 			if asymkey_model.IsErrGPGKeyImportNotExist(err) {
 				failedEntitiesID = append(failedEntitiesID, k.KeyID)
 				continue // Skip previous import without backup of imported armored key
 			}
-			ctx.ServerError("ShowGPGKeys", err)
+			ctx.ServerErrorAuto(err)
 			return
 		}
 		entities = append(entities, e)
@@ -798,8 +687,10 @@ func ShowGPGKeys(ctx *context.Context) {
 	var buf bytes.Buffer
 
 	headers := make(map[string]string)
+	// https://www.rfc-editor.org/rfc/rfc4880
+	headers["Comment"] = "Gitea isn't a key server. The keys are exported as the user uploaded and might not have been fully verified."
 	if len(failedEntitiesID) > 0 { // If some key need re-import to be exported
-		headers["Note"] = fmt.Sprintf("The keys with the following IDs couldn't be exported and need to be reuploaded %s", strings.Join(failedEntitiesID, ", "))
+		headers["Note"] = "The keys with the following IDs couldn't be exported and need to be reuploaded " + strings.Join(failedEntitiesID, ", ")
 	} else if len(entities) == 0 {
 		headers["Note"] = "This user hasn't uploaded any GPG keys."
 	}
@@ -807,7 +698,7 @@ func ShowGPGKeys(ctx *context.Context) {
 	for _, e := range entities {
 		err = e.Serialize(writer) // TODO find why key are exported with a different cipherTypeByte as original (should not be blocking but strange)
 		if err != nil {
-			ctx.ServerError("ShowGPGKeys", err)
+			ctx.ServerErrorAuto(err)
 			return
 		}
 	}
@@ -815,116 +706,128 @@ func ShowGPGKeys(ctx *context.Context) {
 	ctx.PlainTextBytes(http.StatusOK, buf.Bytes())
 }
 
-func UsernameSubRoute(ctx *context.Context) {
-	// WORKAROUND to support usernames with "." in it
-	// https://github.com/go-chi/chi/issues/781
-	username := ctx.Params("username")
-	reloadParam := func(suffix string) (success bool) {
-		ctx.SetParams("username", strings.TrimSuffix(username, suffix))
-		context_service.UserAssignmentWeb()(ctx)
-		return !ctx.Written()
+// UsernamePreRoute rewrites the route path if the username has a suffix, so that the correct handler can be called.
+func UsernamePreRoute(next http.Handler) http.Handler {
+	// HINT: OWNER-NAME-RESERVED-EXT: use the reserved extensions to check and rewrite requests
+	suffixes := container.SetOf(".png", ".keys", ".gpg", feed.ExtNameRss, feed.ExtNameAtom)
+	rewriteRoutePath := func(rctx *chi.Context, r *http.Request) (ownerPath, rewrittenExt string) {
+		if rctx.RouteMethod != "HEAD" && rctx.RouteMethod != "GET" {
+			return "", ""
+		}
+		// if there is no slash in the path, then it is possible to be a username or a username with a suffix
+		possibleUsernameWithSuffix := rctx.RoutePath != "" && strings.IndexByte(rctx.RoutePath[1:], '/') == -1
+		if !possibleUsernameWithSuffix {
+			return "", ""
+		}
+
+		// HINT: USERNAME-AVATAR-APPLE-TOUCH-ICON: skip rewriting the path if it is an apple touch icon request
+		isAppleTouchIcon := rctx.RoutePath == "/apple-touch-icon.png" || rctx.RoutePath == "/apple-touch-icon-precomposed.png"
+		if isAppleTouchIcon {
+			return "", ""
+		}
+
+		// try to extract the suffix from the path, if it is a valid suffix, then rewrite the path to "/-/ownername.png/{username}"
+		ext := path.Ext(rctx.RoutePath)
+		if suffixes.Contains(ext) {
+			return rctx.RoutePath[:len(rctx.RoutePath)-len(ext)], ext
+		}
+		// also try to rewrite "/username" to "/-/ownername.rss/{username}" if the Accept header is for RSS or Atom
+		if strings.Contains(r.Header.Get("Accept"), feed.ContentTypeRssXml) {
+			return rctx.RoutePath, feed.ExtNameRss
+		} else if strings.Contains(r.Header.Get("Accept"), feed.ContentTypeAtomXml) {
+			return rctx.RoutePath, feed.ExtNameAtom
+		}
+		return "", ""
 	}
-	switch {
-	case strings.HasSuffix(username, ".png"):
-		if reloadParam(".png") {
-			AvatarByUserName(ctx)
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rctx := chi.RouteContext(r.Context())
+		if ownerPath, rewrittenExt := rewriteRoutePath(rctx, r); ownerPath != "/" && rewrittenExt != "" {
+			// Owner path can be something like "/" (site home) or "/explore" (endpoint of reserved username)
+			// It's safe to pass the owner path to the handler as is and just let the handler respond 4xx.
+			// Because the server doesn't respond avatar, keys or feeds for these endpoints.
+			rctx.RoutePath = "/-/ownername" + rewrittenExt + ownerPath
 		}
-	case strings.HasSuffix(username, ".keys"):
-		if reloadParam(".keys") {
-			ShowSSHKeys(ctx)
-		}
-	case strings.HasSuffix(username, ".gpg"):
-		if reloadParam(".gpg") {
-			ShowGPGKeys(ctx)
-		}
-	case strings.HasSuffix(username, ".rss"):
-		if !setting.Other.EnableFeed {
-			ctx.Error(http.StatusNotFound)
-			return
-		}
-		if reloadParam(".rss") {
-			context_service.UserAssignmentWeb()(ctx)
-			feed.ShowUserFeedRSS(ctx)
-		}
-	case strings.HasSuffix(username, ".atom"):
-		if !setting.Other.EnableFeed {
-			ctx.Error(http.StatusNotFound)
-			return
-		}
-		if reloadParam(".atom") {
-			feed.ShowUserFeedAtom(ctx)
-		}
-	default:
-		context_service.UserAssignmentWeb()(ctx)
-		if !ctx.Written() {
-			ctx.Data["EnableFeed"] = setting.Other.EnableFeed
-			OwnerProfile(ctx)
-		}
-	}
+		next.ServeHTTP(w, r)
+	})
 }
 
-func getUserIssueStats(ctx *context.Context, filterMode int, opts *issue_indexer.SearchOptions, doerID int64) (*issues_model.IssueStats, error) {
+func getUserIssueStats(ctx *context.Context, ctxUser *user_model.User, filterMode int, opts *issue_indexer.SearchOptions) (ret *issues_model.IssueStats, err error) {
+	ret = &issues_model.IssueStats{}
+	doerID := ctx.Doer.ID
+
 	opts = opts.Copy(func(o *issue_indexer.SearchOptions) {
-		o.AssigneeID = nil
-		o.PosterID = nil
-		o.MentionID = nil
-		o.ReviewRequestedID = nil
-		o.ReviewedID = nil
+		// If the doer is the same as the context user, which means the doer is viewing his own dashboard,
+		// it's not enough to show the repos that the doer owns or has been explicitly granted access to,
+		// because the doer may create issues or be mentioned in any public repo.
+		// So we need search issues in all public repos.
+		o.AllPublic = doerID == ctxUser.ID
 	})
 
-	var (
-		err error
-		ret = &issues_model.IssueStats{}
-	)
-
+	// Open/Closed are for the tabs of the issue list
 	{
 		openClosedOpts := opts.Copy()
 		switch filterMode {
-		case issues_model.FilterModeAll, issues_model.FilterModeYourRepositories:
+		case issues_model.FilterModeAll:
+			// no-op
+		case issues_model.FilterModeYourRepositories:
+			openClosedOpts.AllPublic = false
 		case issues_model.FilterModeAssign:
-			openClosedOpts.AssigneeID = &doerID
+			openClosedOpts.AssigneeID = strconv.FormatInt(doerID, 10)
 		case issues_model.FilterModeCreate:
-			openClosedOpts.PosterID = &doerID
+			openClosedOpts.PosterID = strconv.FormatInt(doerID, 10)
 		case issues_model.FilterModeMention:
-			openClosedOpts.MentionID = &doerID
+			openClosedOpts.MentionID = optional.Some(doerID)
 		case issues_model.FilterModeReviewRequested:
-			openClosedOpts.ReviewRequestedID = &doerID
+			openClosedOpts.ReviewRequestedID = optional.Some(doerID)
 		case issues_model.FilterModeReviewed:
-			openClosedOpts.ReviewedID = &doerID
+			openClosedOpts.ReviewedID = optional.Some(doerID)
 		}
-		openClosedOpts.IsClosed = util.OptionalBoolFalse
+		openClosedOpts.IsClosed = optional.Some(false)
 		ret.OpenCount, err = issue_indexer.CountIssues(ctx, openClosedOpts)
 		if err != nil {
 			return nil, err
 		}
-		openClosedOpts.IsClosed = util.OptionalBoolTrue
+		openClosedOpts.IsClosed = optional.Some(true)
 		ret.ClosedCount, err = issue_indexer.CountIssues(ctx, openClosedOpts)
 		if err != nil {
 			return nil, err
 		}
 	}
 
-	ret.YourRepositoriesCount, err = issue_indexer.CountIssues(ctx, opts)
+	// Below stats are for the left sidebar
+	opts = opts.Copy(func(o *issue_indexer.SearchOptions) {
+		o.AssigneeID = ""
+		o.PosterID = ""
+		o.MentionID = nil
+		o.ReviewRequestedID = nil
+		o.ReviewedID = nil
+	})
+
+	ret.YourRepositoriesCount, err = issue_indexer.CountIssues(ctx, opts.Copy(func(o *issue_indexer.SearchOptions) { o.AllPublic = false }))
 	if err != nil {
 		return nil, err
 	}
-	ret.AssignCount, err = issue_indexer.CountIssues(ctx, opts.Copy(func(o *issue_indexer.SearchOptions) { o.AssigneeID = &doerID }))
+	ret.AssignCount, err = issue_indexer.CountIssues(ctx, opts.Copy(func(o *issue_indexer.SearchOptions) { o.AssigneeID = strconv.FormatInt(doerID, 10) }))
 	if err != nil {
 		return nil, err
 	}
-	ret.CreateCount, err = issue_indexer.CountIssues(ctx, opts.Copy(func(o *issue_indexer.SearchOptions) { o.PosterID = &doerID }))
+	ret.CreateCount, err = issue_indexer.CountIssues(ctx, opts.Copy(func(o *issue_indexer.SearchOptions) { o.PosterID = strconv.FormatInt(doerID, 10) }))
 	if err != nil {
 		return nil, err
 	}
-	ret.MentionCount, err = issue_indexer.CountIssues(ctx, opts.Copy(func(o *issue_indexer.SearchOptions) { o.MentionID = &doerID }))
+	ret.MentionCount, err = issue_indexer.CountIssues(ctx, opts.Copy(func(o *issue_indexer.SearchOptions) { o.MentionID = optional.Some(doerID) }))
 	if err != nil {
 		return nil, err
 	}
-	ret.ReviewRequestedCount, err = issue_indexer.CountIssues(ctx, opts.Copy(func(o *issue_indexer.SearchOptions) { o.ReviewRequestedID = &doerID }))
+	if !opts.IsPull.Value() {
+		return ret, nil
+	}
+	ret.ReviewRequestedCount, err = issue_indexer.CountIssues(ctx, opts.Copy(func(o *issue_indexer.SearchOptions) { o.ReviewRequestedID = optional.Some(doerID) }))
 	if err != nil {
 		return nil, err
 	}
-	ret.ReviewedCount, err = issue_indexer.CountIssues(ctx, opts.Copy(func(o *issue_indexer.SearchOptions) { o.ReviewedID = &doerID }))
+	ret.ReviewedCount, err = issue_indexer.CountIssues(ctx, opts.Copy(func(o *issue_indexer.SearchOptions) { o.ReviewedID = optional.Some(doerID) }))
 	if err != nil {
 		return nil, err
 	}

@@ -9,8 +9,9 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 
-	"code.gitea.io/gitea/modules/log"
+	"gitea.dev/modules/log"
 )
 
 const (
@@ -20,7 +21,15 @@ const (
 
 const escapeRegexpString = "_0[xX](([0-9a-fA-F][0-9a-fA-F])+)_"
 
-var escapeRegex = regexp.MustCompile(escapeRegexpString)
+var globalVars = sync.OnceValue(func() (ret struct {
+	escapeRegex  *regexp.Regexp
+	extensionReg *regexp.Regexp
+},
+) {
+	ret.escapeRegex = regexp.MustCompile(escapeRegexpString)
+	ret.extensionReg = regexp.MustCompile(`^(\.[-\w]+)+$`)
+	return ret
+})
 
 func CollectEnvConfigKeys() (keys []string) {
 	for _, env := range os.Environ() {
@@ -47,14 +56,14 @@ func ClearEnvConfigKeys() {
 func decodeEnvSectionKey(encoded string) (ok bool, section, key string) {
 	inKey := false
 	last := 0
-	escapeStringIndices := escapeRegex.FindAllStringIndex(encoded, -1)
+	escapeStringIndices := globalVars().escapeRegex.FindAllStringIndex(encoded, -1)
 	for _, unescapeIdx := range escapeStringIndices {
 		preceding := encoded[last:unescapeIdx[0]]
 		if !inKey {
-			if splitter := strings.Index(preceding, "__"); splitter > -1 {
-				section += preceding[:splitter]
+			if before, after, cutOk := strings.Cut(preceding, "__"); cutOk {
+				section += before
 				inKey = true
-				key += preceding[splitter+2:]
+				key += after
 			} else {
 				section += preceding
 			}
@@ -65,7 +74,7 @@ func decodeEnvSectionKey(encoded string) (ok bool, section, key string) {
 		decodedBytes := make([]byte, len(toDecode)/2)
 		for i := 0; i < len(toDecode)/2; i++ {
 			// Can ignore error here as we know these should be hexadecimal from the regexp
-			byteInt, _ := strconv.ParseInt(toDecode[2*i:2*i+2], 16, 0)
+			byteInt, _ := strconv.ParseInt(toDecode[2*i:2*i+2], 16, 8)
 			decodedBytes[i] = byte(byteInt)
 		}
 		if inKey {
@@ -77,9 +86,9 @@ func decodeEnvSectionKey(encoded string) (ok bool, section, key string) {
 	}
 	remaining := encoded[last:]
 	if !inKey {
-		if splitter := strings.Index(remaining, "__"); splitter > -1 {
-			section += remaining[:splitter]
-			key += remaining[splitter+2:]
+		if before, after, cutOk := strings.Cut(remaining, "__"); cutOk {
+			section += before
+			key += after
 		} else {
 			section += remaining
 		}
@@ -111,14 +120,14 @@ func decodeEnvironmentKey(prefixGitea, suffixFile, envKey string) (ok bool, sect
 
 func EnvironmentToConfig(cfg ConfigProvider, envs []string) (changed bool) {
 	for _, kv := range envs {
-		idx := strings.IndexByte(kv, '=')
-		if idx < 0 {
+		before, after, ok := strings.Cut(kv, "=")
+		if !ok {
 			continue
 		}
 
 		// parse the environment variable to config section name and key name
-		envKey := kv[:idx]
-		envValue := kv[idx+1:]
+		envKey := before
+		envValue := after
 		ok, sectionName, keyName, useFileValue := decodeEnvironmentKey(EnvConfigKeyPrefixGitea, EnvConfigKeySuffixFile, envKey)
 		if !ok {
 			continue
@@ -149,8 +158,9 @@ func EnvironmentToConfig(cfg ConfigProvider, envs []string) (changed bool) {
 				continue
 			}
 		}
-		key := section.Key(keyName)
+		key := ConfigSectionKey(section, keyName)
 		if key == nil {
+			changed = true
 			key, err = section.NewKey(keyName, keyValue)
 			if err != nil {
 				log.Error("Error creating key: %s in section: %s with value: %s : %v", keyName, sectionName, keyValue, err)
@@ -164,4 +174,15 @@ func EnvironmentToConfig(cfg ConfigProvider, envs []string) (changed bool) {
 		key.SetValue(keyValue)
 	}
 	return changed
+}
+
+func UnsetUnnecessaryEnvVars() {
+	// Ideally Gitea should only accept the environment variables which it clearly knows instead of unsetting the ones it doesn't want,
+	// but the ideal behavior would be a breaking change, and it seems not bringing enough benefits to end users.
+	// So at the moment we just keep "unsetting the unnecessary environment variables".
+
+	// HOME is managed by Gitea, Gitea's git should use "HOME/.gitconfig".
+	// But git would try "XDG_CONFIG_HOME/git/config" first if "HOME/.gitconfig" does not exist,
+	// then our git.InitFull would still write to "XDG_CONFIG_HOME/git/config" if XDG_CONFIG_HOME is set.
+	_ = os.Unsetenv("XDG_CONFIG_HOME")
 }

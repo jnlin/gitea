@@ -6,7 +6,7 @@ package private
 import (
 	"context"
 
-	"code.gitea.io/gitea/modules/setting"
+	"gitea.dev/modules/setting"
 )
 
 type GenerateTokenRequest struct {
@@ -14,13 +14,12 @@ type GenerateTokenRequest struct {
 }
 
 // GenerateActionsRunnerToken calls the internal GenerateActionsRunnerToken function
-func GenerateActionsRunnerToken(ctx context.Context, scope string) (string, ResponseExtra) {
+func GenerateActionsRunnerToken(ctx context.Context, scope string) (*ResponseText, ResponseExtra) {
 	reqURL := setting.LocalURL + "api/internal/actions/generate_actions_runner_token"
 
-	req := newInternalRequest(ctx, reqURL, "POST", GenerateTokenRequest{
+	req := newInternalRequestAPI(ctx, reqURL, "POST", GenerateTokenRequest{
 		Scope: scope,
 	})
 
-	resp, extra := requestJSONResp(req, &responseText{})
-	return resp.Text, extra
+	return requestJSONResp(req, &ResponseText{})
 }

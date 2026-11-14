@@ -5,15 +5,16 @@ package actions
 
 import (
 	"context"
+	"fmt"
 	"time"
 
-	"code.gitea.io/gitea/models/db"
-	repo_model "code.gitea.io/gitea/models/repo"
-	user_model "code.gitea.io/gitea/models/user"
-	"code.gitea.io/gitea/modules/timeutil"
-	webhook_module "code.gitea.io/gitea/modules/webhook"
-
-	"github.com/robfig/cron/v3"
+	"gitea.dev/models/db"
+	repo_model "gitea.dev/models/repo"
+	user_model "gitea.dev/models/user"
+	"gitea.dev/modules/git"
+	"gitea.dev/modules/timeutil"
+	"gitea.dev/modules/util"
+	webhook_module "gitea.dev/modules/webhook"
 )
 
 // ActionSchedule represents a schedule of a workflow file
@@ -30,8 +31,8 @@ type ActionSchedule struct {
 	Ref           string
 	CommitSHA     string
 	Event         webhook_module.HookEventType
-	EventPayload  string `xorm:"LONGTEXT"`
-	Content       []byte
+	EventPayload  string             `xorm:"LONGTEXT"`
+	Content       []byte             `xorm:"LONGBLOB"`
 	Created       timeutil.TimeStamp `xorm:"created"`
 	Updated       timeutil.TimeStamp `xorm:"updated"`
 }
@@ -40,81 +41,120 @@ func init() {
 	db.RegisterModel(new(ActionSchedule))
 }
 
-// GetSchedulesMapByIDs returns the schedules by given id slice.
-func GetSchedulesMapByIDs(ctx context.Context, ids []int64) (map[int64]*ActionSchedule, error) {
-	schedules := make(map[int64]*ActionSchedule, len(ids))
-	return schedules, db.GetEngine(ctx).In("id", ids).Find(&schedules)
+type scheduleSpecKey struct {
+	scheduleID int64
+	spec       string
 }
 
-// GetReposMapByIDs returns the repos by given id slice.
-func GetReposMapByIDs(ctx context.Context, ids []int64) (map[int64]*repo_model.Repository, error) {
-	repos := make(map[int64]*repo_model.Repository, len(ids))
-	return repos, db.GetEngine(ctx).In("id", ids).Find(&repos)
-}
-
-var cronParser = cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow | cron.Descriptor)
-
-// CreateScheduleTask creates new schedule task.
-func CreateScheduleTask(ctx context.Context, rows []*ActionSchedule) error {
-	// Return early if there are no rows to insert
-	if len(rows) == 0 {
-		return nil
-	}
-
-	// Begin transaction
-	ctx, committer, err := db.TxContext(ctx)
-	if err != nil {
-		return err
-	}
-	defer committer.Close()
-
-	// Loop through each schedule row
-	for _, row := range rows {
-		// Create new schedule row
-		if err = db.Insert(ctx, row); err != nil {
+// ReplaceScheduleTasksByRepo updates schedules in place and keeps the specs of unchanged crons, so re-registering cannot skip a due occurrence.
+func ReplaceScheduleTasksByRepo(ctx context.Context, repoID int64, rows []*ActionSchedule) error {
+	return db.WithTx(ctx, func(ctx context.Context) error {
+		var oldSchedules []*ActionSchedule
+		if err := db.GetEngine(ctx).Cols("id", "workflow_id").Where("repo_id = ?", repoID).Find(&oldSchedules); err != nil {
 			return err
 		}
+		var oldSpecs []*ActionScheduleSpec
+		if err := db.GetEngine(ctx).Cols("id", "schedule_id", "spec").Where("repo_id = ?", repoID).Find(&oldSpecs); err != nil {
+			return err
+		}
+		scheduleIDs := make(map[string]int64, len(oldSchedules))
+		for _, schedule := range oldSchedules {
+			scheduleIDs[schedule.WorkflowID] = schedule.ID
+		}
+		specIDs := make(map[scheduleSpecKey]int64, len(oldSpecs))
+		for _, spec := range oldSpecs {
+			specIDs[scheduleSpecKey{spec.ScheduleID, spec.Spec}] = spec.ID
+		}
 
-		// Loop through each schedule spec and create a new spec row
-		now := time.Now()
+		var keptScheduleIDs, keptSpecIDs []int64
 
-		for _, spec := range row.Specs {
-			// Parse the spec and check for errors
-			schedule, err := cronParser.Parse(spec)
-			if err != nil {
-				continue // skip to the next spec if there's an error
-			}
-
-			// Insert the new schedule spec row
-			if err = db.Insert(ctx, &ActionScheduleSpec{
-				RepoID:     row.RepoID,
-				ScheduleID: row.ID,
-				Spec:       spec,
-				Next:       timeutil.TimeStamp(schedule.Next(now).Unix()),
-			}); err != nil {
+		// Loop through each schedule row
+		for _, row := range rows {
+			row.Title = util.EllipsisDisplayString(row.Title, 255)
+			if id, ok := scheduleIDs[row.WorkflowID]; ok {
+				row.ID = id
+				if _, err := db.GetEngine(ctx).ID(id).AllCols().Update(row); err != nil {
+					return err
+				}
+			} else if err := db.Insert(ctx, row); err != nil {
 				return err
 			}
-		}
-	}
+			keptScheduleIDs = append(keptScheduleIDs, row.ID)
 
-	// Commit transaction
-	return committer.Commit()
+			// Loop through each schedule spec and create a new spec row
+			now := time.Now()
+
+			for _, spec := range row.Specs {
+				key := scheduleSpecKey{row.ID, spec}
+				if id, ok := specIDs[key]; ok {
+					delete(specIDs, key)
+					keptSpecIDs = append(keptSpecIDs, id)
+					continue
+				}
+
+				specRow := &ActionScheduleSpec{
+					RepoID:     row.RepoID,
+					ScheduleID: row.ID,
+					Spec:       spec,
+				}
+				schedule, err := specRow.Parse()
+				if err != nil {
+					continue
+				}
+
+				next := schedule.Next(now)
+				if next.IsZero() {
+					continue // the spec parses but can never occur, like "0 0 30 2 *"
+				}
+				specRow.Next = timeutil.TimeStamp(next.Unix())
+
+				// Insert the new schedule spec row
+				if err = db.Insert(ctx, specRow); err != nil {
+					return err
+				}
+				keptSpecIDs = append(keptSpecIDs, specRow.ID)
+			}
+		}
+
+		// an empty NotIn matches every row
+		if _, err := db.GetEngine(ctx).Where("repo_id = ?", repoID).NotIn("id", keptScheduleIDs).Delete(&ActionSchedule{}); err != nil {
+			return err
+		}
+		_, err := db.GetEngine(ctx).Where("repo_id = ?", repoID).NotIn("id", keptSpecIDs).Delete(&ActionScheduleSpec{})
+		return err
+	})
 }
 
 func DeleteScheduleTaskByRepo(ctx context.Context, id int64) error {
-	ctx, committer, err := db.TxContext(ctx)
+	return db.WithTx(ctx, func(ctx context.Context) error {
+		if _, err := db.GetEngine(ctx).Delete(&ActionSchedule{RepoID: id}); err != nil {
+			return err
+		}
+
+		if _, err := db.GetEngine(ctx).Delete(&ActionScheduleSpec{RepoID: id}); err != nil {
+			return err
+		}
+
+		return nil
+	})
+}
+
+func CleanRepoScheduleTasks(ctx context.Context, repo *repo_model.Repository) ([]*ActionRunJob, error) {
+	// If actions disabled when there is schedule task, this will remove the outdated schedule tasks
+	// There is no other place we can do this because the app.ini will be changed manually
+	if err := DeleteScheduleTaskByRepo(ctx, repo.ID); err != nil {
+		return nil, fmt.Errorf("CleanRepoScheduleTasks: %w", err)
+	}
+	// cancel running cron jobs of this repository and delete old schedules
+	jobs, err := CancelPreviousJobs(
+		ctx,
+		repo.ID,
+		git.RefNameFromBranch(repo.DefaultBranch).String(),
+		"",
+		webhook_module.HookEventSchedule,
+	)
 	if err != nil {
-		return err
+		return jobs, fmt.Errorf("CleanRepoScheduleTasks: %w", err)
 	}
-	defer committer.Close()
-
-	if _, err := db.GetEngine(ctx).Delete(&ActionSchedule{RepoID: id}); err != nil {
-		return err
-	}
-
-	if _, err := db.GetEngine(ctx).Delete(&ActionScheduleSpec{RepoID: id}); err != nil {
-		return err
-	}
-
-	return committer.Commit()
+	return jobs, nil
 }

@@ -4,7 +4,7 @@
 package repository
 
 import (
-	"code.gitea.io/gitea/modules/git"
+	"gitea.dev/modules/git"
 )
 
 // PushUpdateOptions defines the push update options
@@ -13,19 +13,24 @@ type PushUpdateOptions struct {
 	PusherName   string
 	RepoUserName string
 	RepoName     string
-	RefFullName  git.RefName // branch, tag or other name to push
-	OldCommitID  string
-	NewCommitID  string
+
+	// FIXME: this struct's design is not right, the changed commits should be in a separate slice
+
+	RefFullName git.RefName // branch, tag or other name to push
+	OldCommitID string
+	NewCommitID string
 }
 
 // IsNewRef return true if it's a first-time push to a branch, tag or etc.
 func (opts *PushUpdateOptions) IsNewRef() bool {
-	return opts.OldCommitID == git.EmptySHA
+	commitID, err := git.NewIDFromString(opts.OldCommitID)
+	return err == nil && commitID.IsZero()
 }
 
 // IsDelRef return true if it's a deletion to a branch or tag
 func (opts *PushUpdateOptions) IsDelRef() bool {
-	return opts.NewCommitID == git.EmptySHA
+	commitID, err := git.NewIDFromString(opts.NewCommitID)
+	return err == nil && commitID.IsZero()
 }
 
 // IsUpdateRef return true if it's an update operation

@@ -5,28 +5,36 @@ package issue
 
 import (
 	"context"
+	"slices"
 
-	"code.gitea.io/gitea/models/db"
-	issues_model "code.gitea.io/gitea/models/issues"
-	access_model "code.gitea.io/gitea/models/perm/access"
-	user_model "code.gitea.io/gitea/models/user"
-	notify_service "code.gitea.io/gitea/services/notify"
+	"gitea.dev/models/db"
+	issues_model "gitea.dev/models/issues"
+	access_model "gitea.dev/models/perm/access"
+	user_model "gitea.dev/models/user"
+	notify_service "gitea.dev/services/notify"
 )
 
 // ClearLabels clears all of an issue's labels
 func ClearLabels(ctx context.Context, issue *issues_model.Issue, doer *user_model.User) error {
-	if err := issues_model.ClearIssueLabels(issue, doer); err != nil {
+	if err := issue.LoadLabels(ctx); err != nil {
+		return err
+	}
+	hadLabels := len(issue.Labels) > 0
+
+	if err := issues_model.ClearIssueLabels(ctx, issue, doer); err != nil {
 		return err
 	}
 
-	notify_service.IssueClearLabels(ctx, doer, issue)
+	if hadLabels {
+		notify_service.IssueClearLabels(ctx, doer, issue)
+	}
 
 	return nil
 }
 
 // AddLabel adds a new label to the issue.
 func AddLabel(ctx context.Context, issue *issues_model.Issue, doer *user_model.User, label *issues_model.Label) error {
-	if err := issues_model.NewIssueLabel(issue, label, doer); err != nil {
+	if err := issues_model.NewIssueLabel(ctx, issue, label, doer); err != nil {
 		return err
 	}
 
@@ -36,7 +44,7 @@ func AddLabel(ctx context.Context, issue *issues_model.Issue, doer *user_model.U
 
 // AddLabels adds a list of new labels to the issue.
 func AddLabels(ctx context.Context, issue *issues_model.Issue, doer *user_model.User, labels []*issues_model.Label) error {
-	if err := issues_model.NewIssueLabels(issue, labels, doer); err != nil {
+	if err := issues_model.NewIssueLabels(ctx, issue, labels, doer); err != nil {
 		return err
 	}
 
@@ -46,32 +54,24 @@ func AddLabels(ctx context.Context, issue *issues_model.Issue, doer *user_model.
 
 // RemoveLabel removes a label from issue by given ID.
 func RemoveLabel(ctx context.Context, issue *issues_model.Issue, doer *user_model.User, label *issues_model.Label) error {
-	dbCtx, committer, err := db.TxContext(ctx)
-	if err != nil {
-		return err
-	}
-	defer committer.Close()
-
-	if err := issue.LoadRepo(dbCtx); err != nil {
-		return err
-	}
-
-	perm, err := access_model.GetUserRepoPermission(dbCtx, issue.Repo, doer)
-	if err != nil {
-		return err
-	}
-	if !perm.CanWriteIssuesOrPulls(issue.IsPull) {
-		if label.OrgID > 0 {
-			return issues_model.ErrOrgLabelNotExist{}
+	if err := db.WithTx(ctx, func(ctx context.Context) error {
+		if err := issue.LoadRepo(ctx); err != nil {
+			return err
 		}
-		return issues_model.ErrRepoLabelNotExist{}
-	}
 
-	if err := issues_model.DeleteIssueLabel(dbCtx, issue, label, doer); err != nil {
-		return err
-	}
+		perm, err := access_model.GetDoerRepoPermission(ctx, issue.Repo, doer)
+		if err != nil {
+			return err
+		}
+		if !perm.CanWriteIssuesOrPulls(issue.IsPull) {
+			if label.OrgID > 0 {
+				return issues_model.ErrOrgLabelNotExist{}
+			}
+			return issues_model.ErrRepoLabelNotExist{}
+		}
 
-	if err := committer.Commit(); err != nil {
+		return issues_model.DeleteIssueLabel(ctx, issue, label, doer)
+	}); err != nil {
 		return err
 	}
 
@@ -86,10 +86,51 @@ func ReplaceLabels(ctx context.Context, issue *issues_model.Issue, doer *user_mo
 		return err
 	}
 
-	if err := issues_model.ReplaceIssueLabels(issue, labels, doer); err != nil {
+	if err := issues_model.ReplaceIssueLabels(ctx, issue, labels, doer); err != nil {
 		return err
 	}
 
-	notify_service.IssueChangeLabels(ctx, doer, issue, labels, old)
+	notifyLabelChanges(ctx, doer, issue, old)
 	return nil
+}
+
+func AddRemoveLabels(ctx context.Context, issue *issues_model.Issue, doer *user_model.User, toAdd, toRemove []*issues_model.Label) error {
+	oldLabels, err := issues_model.GetLabelsByIssueID(ctx, issue.ID)
+	if err != nil {
+		return err
+	}
+
+	if err := db.WithTx(ctx, func(ctx context.Context) error {
+		if err := issues_model.NewIssueLabels(ctx, issue, toAdd, doer); err != nil {
+			return err
+		}
+		for _, label := range toRemove {
+			if err := issues_model.DeleteIssueLabel(ctx, issue, label, doer); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	notifyLabelChanges(ctx, doer, issue, oldLabels)
+	return nil
+}
+
+func notifyLabelChanges(ctx context.Context, doer *user_model.User, issue *issues_model.Issue, oldLabels []*issues_model.Label) {
+	var added, removed []*issues_model.Label
+	for _, label := range issue.Labels {
+		if !slices.ContainsFunc(oldLabels, func(old *issues_model.Label) bool { return old.ID == label.ID }) {
+			added = append(added, label)
+		}
+	}
+	for _, label := range oldLabels {
+		if !slices.ContainsFunc(issue.Labels, func(current *issues_model.Label) bool { return current.ID == label.ID }) {
+			removed = append(removed, label)
+		}
+	}
+	if len(added) > 0 || len(removed) > 0 {
+		notify_service.IssueChangeLabels(ctx, doer, issue, added, removed)
+	}
 }

@@ -4,13 +4,15 @@
 package convert
 
 import (
-	repo_model "code.gitea.io/gitea/models/repo"
-	api "code.gitea.io/gitea/modules/structs"
+	"context"
+
+	repo_model "gitea.dev/models/repo"
+	api "gitea.dev/modules/structs"
 )
 
 // ToPushMirror convert from repo_model.PushMirror and remoteAddress to api.TopicResponse
-func ToPushMirror(pm *repo_model.PushMirror) (*api.PushMirror, error) {
-	repo := pm.GetRepository()
+func ToPushMirror(ctx context.Context, pm *repo_model.PushMirror) (*api.PushMirror, error) {
+	repo := pm.GetRepository(ctx)
 	return &api.PushMirror{
 		RepoName:       repo.Name,
 		RemoteName:     pm.RemoteName,

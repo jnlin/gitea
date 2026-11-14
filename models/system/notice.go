@@ -8,11 +8,11 @@ import (
 	"fmt"
 	"time"
 
-	"code.gitea.io/gitea/models/db"
-	"code.gitea.io/gitea/modules/log"
-	"code.gitea.io/gitea/modules/storage"
-	"code.gitea.io/gitea/modules/timeutil"
-	"code.gitea.io/gitea/modules/util"
+	"gitea.dev/models/db"
+	"gitea.dev/modules/graceful"
+	"gitea.dev/modules/log"
+	"gitea.dev/modules/storage"
+	"gitea.dev/modules/timeutil"
 )
 
 // NoticeType describes the notice type
@@ -29,7 +29,7 @@ const (
 type Notice struct {
 	ID          int64 `xorm:"pk autoincr"`
 	Type        NoticeType
-	Description string             `xorm:"TEXT"`
+	Description string             `xorm:"LONGTEXT"`
 	CreatedUnix timeutil.TimeStamp `xorm:"INDEX created"`
 }
 
@@ -56,21 +56,7 @@ func CreateNotice(ctx context.Context, tp NoticeType, desc string, args ...any) 
 
 // CreateRepositoryNotice creates new system notice with type NoticeRepository.
 func CreateRepositoryNotice(desc string, args ...any) error {
-	// Note we use the db.DefaultContext here rather than passing in a context as the context may be cancelled
-	return CreateNotice(db.DefaultContext, NoticeRepository, desc, args...)
-}
-
-// RemoveAllWithNotice removes all directories in given path and
-// creates a system notice when error occurs.
-func RemoveAllWithNotice(ctx context.Context, title, path string) {
-	if err := util.RemoveAll(path); err != nil {
-		desc := fmt.Sprintf("%s [%s]: %v", title, path, err)
-		log.Warn(title+" [%s]: %v", path, err)
-		// Note we use the db.DefaultContext here rather than passing in a context as the context may be cancelled
-		if err = CreateNotice(db.DefaultContext, NoticeRepository, desc); err != nil {
-			log.Error("CreateRepositoryNotice: %v", err)
-		}
-	}
+	return CreateNotice(graceful.GetManager().ShutdownContext(), NoticeRepository, desc, args...)
 }
 
 // RemoveStorageWithNotice removes a file from the storage and
@@ -80,16 +66,15 @@ func RemoveStorageWithNotice(ctx context.Context, bucket storage.ObjectStorage, 
 		desc := fmt.Sprintf("%s [%s]: %v", title, path, err)
 		log.Warn(title+" [%s]: %v", path, err)
 
-		// Note we use the db.DefaultContext here rather than passing in a context as the context may be cancelled
-		if err = CreateNotice(db.DefaultContext, NoticeRepository, desc); err != nil {
+		if err = CreateNotice(graceful.GetManager().ShutdownContext(), NoticeRepository, desc); err != nil {
 			log.Error("CreateRepositoryNotice: %v", err)
 		}
 	}
 }
 
 // CountNotices returns number of notices.
-func CountNotices() int64 {
-	count, _ := db.GetEngine(db.DefaultContext).Count(new(Notice))
+func CountNotices(ctx context.Context) int64 {
+	count, _ := db.GetEngine(ctx).Count(new(Notice))
 	return count
 }
 
@@ -100,12 +85,6 @@ func Notices(ctx context.Context, page, pageSize int) ([]*Notice, error) {
 		Limit(pageSize, (page-1)*pageSize).
 		Desc("created_unix").
 		Find(&notices)
-}
-
-// DeleteNotice deletes a system notice by given ID.
-func DeleteNotice(ctx context.Context, id int64) error {
-	_, err := db.GetEngine(ctx).ID(id).Delete(new(Notice))
-	return err
 }
 
 // DeleteNotices deletes all notices with ID from start to end (inclusive).
@@ -120,17 +99,6 @@ func DeleteNotices(ctx context.Context, start, end int64) error {
 		sess.And("id <= ?", end)
 	}
 	_, err := sess.Delete(new(Notice))
-	return err
-}
-
-// DeleteNoticesByIDs deletes notices by given IDs.
-func DeleteNoticesByIDs(ctx context.Context, ids []int64) error {
-	if len(ids) == 0 {
-		return nil
-	}
-	_, err := db.GetEngine(ctx).
-		In("id", ids).
-		Delete(new(Notice))
 	return err
 }
 
